@@ -38,5 +38,13 @@ def init_db():
     finally:
         conn.close()
 
-    from app.models import order, production  # noqa: F401
-    Base.metadata.create_all(bind=engine)
+    # 建表：多 worker 并发时会撞 "Table already exists"，忽略即可
+    try:
+        from app.models import order, production
+        Base.metadata.create_all(bind=engine)
+    except Exception as e:
+        import logging
+        logging.warning("create_all 并发冲突，已忽略: %s", e)
+
+    # from app.models import order, production  # noqa: F401
+    # Base.metadata.create_all(bind=engine)
