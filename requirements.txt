@@ -1,0 +1,13 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0
+pydantic-settings>=2.0
+sqlalchemy>=2.0
+pymysql>=1.1
+cryptography>=42.0
+qrcode[pil]>=7.4
+pillow>=10.0
+python-multipart>=0.0.9
+# 解析 CAM 软件导出的钢料设定单（老式二进制 .xls），累加「时间」列得到程序时间。
+# xlrd 2.x 只支持 .xls、不支持 .xlsx，正好匹配图纸模板的格式。
+xlrd>=2.0,<3
