@@ -26,6 +26,7 @@ from app.models.order import (
     resolve_order_status,
 )
 from app.models.production import (
+    POSITION_ADMIN,
     POSITION_PROGRAMMER,
     POSITION_QC,
     WORK_ORDER_STATUS_DONE,
@@ -50,10 +51,39 @@ from app.models.quality import (
 )
 from app.program_sheet import ProgramSheetError, parse_program_sheet
 from app.routers.auth import TOKENS
+from app.routers.contracts import (
+    get_contract,
+    import_contract,
+    list_contracts,
+    update_contract_item_quantity,
+    update_contract_status,
+)
 from app.routers.production import complete_work, list_order_employees, startable_error
 from app.routers.quality import pending_qty, stage_pending_map, submit_judgment
+from app.routers.quotes import (
+    get_quote,
+    import_quote,
+    list_quotes,
+    quote_history,
+    update_quote_item,
+)
+from app.schemas.contract import (
+    ContractDetail,
+    ContractImport,
+    ContractItemQuantityUpdate,
+    ContractStatusUpdate,
+    ContractSummary,
+)
 from app.schemas.production import CompleteWorkItem, CompleteWorkRequest, ContributionIn
 from app.schemas.quality import OwnerIn, QcJudgmentRequest, Stage
+from app.schemas.quote import (
+    QuoteDetail,
+    QuoteImport,
+    QuoteItemHistory,
+    QuoteItemOut,
+    QuoteItemUpdate,
+    QuoteSummary,
+)
 
 router = APIRouter(prefix="/api/mp", tags=["mp"])
 

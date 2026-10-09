@@ -13,11 +13,14 @@ EMPLOYEE_TYPE_DIRECT = "直属员工"
 EMPLOYEE_TYPE_OUTSOURCED = "外包员工"
 EMPLOYEE_TYPES = (EMPLOYEE_TYPE_DIRECT, EMPLOYEE_TYPE_OUTSOURCED)
 
-# 岗位。目前只有「编程」「质检」两个岗位参与代码判定（小程序「我的订单」按岗位
-# 决定列表口径、以及能不能编辑程序时间 / 做质检判定）；操作工只是 web 端下拉里
-# 的选项，不做逻辑分支。
+# 岗位。「编程」「质检」「管理员」三个岗位参与代码判定：
+#   编程   → 小程序「我的订单」看待编程订单，可填程序时间
+#   质检   → 小程序「我的订单」看待质检订单，可做质检判定
+#   管理员 → 小程序解锁「报价管理」模块（报价单 + 合同全是商务数据）
+# 操作工只是 web 端下拉里的选项，不做逻辑分支。
 POSITION_PROGRAMMER = "编程"
 POSITION_QC = "质检"
+POSITION_ADMIN = "管理员"
 
 
 class Employee(Base):
