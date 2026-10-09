@@ -1373,6 +1373,109 @@ def save_program_time(
     return _order_detail(db, order, emp)
 
 
+# ------------------------------------------------- 报价管理（仅管理员岗位）
+
+
+def _require_admin(user, db: Session) -> Employee:
+    """取当前登录员工并确认是管理员。
+
+    报价单与合同全是商务数据（单价、总价、甲方、银行账户、税号），
+    车间员工一律 403。业务逻辑不重写，各端点直接委托 web 端那套实现，
+    这里只负责把门。
+    """
+    emp = _current_employee(user, db)
+    if emp.position != POSITION_ADMIN:
+        raise HTTPException(
+            403,
+            f"只有「{POSITION_ADMIN}」岗位可以访问报价管理，"
+            f"你当前岗位是「{emp.position}」",
+        )
+    return emp
+
+
+@router.get("/quotes", response_model=list[QuoteSummary])
+def mp_list_quotes(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    _require_admin(user, db)
+    return list_quotes(db)
+
+
+@router.post("/quotes/import", response_model=QuoteDetail)
+def mp_import_quote(
+    payload: QuoteImport, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    _require_admin(user, db)
+    return import_quote(payload, db)
+
+
+@router.get("/quotes/{quote_id}", response_model=QuoteDetail)
+def mp_get_quote(quote_id: str, user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    _require_admin(user, db)
+    return get_quote(quote_id, db)
+
+
+@router.get("/quotes/{quote_id}/history", response_model=list[QuoteItemHistory])
+def mp_quote_history(quote_id: str, user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    _require_admin(user, db)
+    return quote_history(quote_id, db)
+
+
+@router.patch("/quotes/{quote_id}/items/{item_id}", response_model=QuoteItemOut)
+def mp_update_quote_item(
+    quote_id: str,
+    item_id: int,
+    req: QuoteItemUpdate,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user, db)
+    return update_quote_item(quote_id, item_id, req, db)
+
+
+@router.get("/contracts", response_model=list[ContractSummary])
+def mp_list_contracts(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    _require_admin(user, db)
+    return list_contracts(db)
+
+
+@router.post("/contracts/import", response_model=ContractDetail)
+def mp_import_contract(
+    payload: ContractImport, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    _require_admin(user, db)
+    return import_contract(payload, db)
+
+
+@router.get("/contracts/{contract_id}", response_model=ContractDetail)
+def mp_get_contract(
+    contract_id: str, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    _require_admin(user, db)
+    return get_contract(contract_id, db)
+
+
+@router.patch("/contracts/{contract_id}/status", response_model=ContractDetail)
+def mp_update_contract_status(
+    contract_id: str,
+    req: ContractStatusUpdate,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user, db)
+    return update_contract_status(contract_id, req, db)
+
+
+@router.patch("/contracts/{contract_id}/items/{item_id}", response_model=ContractDetail)
+def mp_update_contract_item(
+    contract_id: str,
+    item_id: int,
+    req: ContractItemQuantityUpdate,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user, db)
+    return update_contract_item_quantity(contract_id, item_id, req, db)
+
+
 @router.post("/orders/{order_id}/judgment", response_model=MpJudgmentResultOut)
 def submit_my_judgment(
     order_id: str,
