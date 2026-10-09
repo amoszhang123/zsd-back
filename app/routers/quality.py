@@ -367,6 +367,24 @@ def pending_qty(db: Session, order_id: str, stage: str) -> tuple[int, int]:
     return upstream, max(0, upstream - inspected)
 
 
+def stage_pending_map(db: Session, stage: str) -> dict[str, int]:
+    """订单 → 本阶段待检数量，只包含 >0 的（即真正还需要检的）。
+
+    qc_queue 的待检队列和小程序「我的订单」的「待质检」共用这一个口径，
+    免得两边各算一套、同一张订单在一处算待检另一处算检完。
+    """
+    upstream = _upstream_qty_map(db, stage)
+    if not upstream:
+        return {}
+    stats = _stage_stats(db, list(upstream), stage)
+    out: dict[str, int] = {}
+    for order_id, up in upstream.items():
+        left = max(0, up - stats.get(order_id, {}).get("inspected", 0))
+        if left > 0:
+            out[order_id] = left
+    return out
+
+
 @router.get("/queue", response_model=list[QcQueueItem])
 def qc_queue(stage: Stage, db: Session = Depends(get_db)):
     """某阶段的待检队列：只要还有未质检的产出数量就会出现，待检多的排前面。"""
@@ -435,6 +453,8 @@ def list_inspections(
             remark=b.remark,
             employee_id=b.employee_id,
             employee_name=b.employee.name if b.employee else "",
+            inspector_id=b.inspector_id,
+            inspector_name=b.inspector.name if b.inspector else "",
             created_at=b.created_at,
         )
         for b in batches
@@ -453,6 +473,13 @@ def submit_judgment(req: QcJudgmentRequest, db: Session = Depends(get_db)):
         if not employee:
             raise HTTPException(404, f"员工不存在: {req.employee_id}")
         employee_id = employee.id
+
+    inspector_id = None
+    if req.inspector_id:
+        inspector = db.query(Employee).filter(Employee.id == req.inspector_id).first()
+        if not inspector:
+            raise HTTPException(404, f"质检员不存在: {req.inspector_id}")
+        inspector_id = inspector.id
 
     upstream, pending = pending_qty(db, order.id, req.stage)
     if pending <= 0:
@@ -528,6 +555,7 @@ def submit_judgment(req: QcJudgmentRequest, db: Session = Depends(get_db)):
             verdict=verdict,
             remark=req.remark,
             employee_id=employee_id,
+            inspector_id=inspector_id,
         )
     )
 

@@ -93,6 +93,9 @@ class QcJudgmentRequest(BaseModel):
     scrap_qty: int = Field(default=0, ge=0)
     verdict: Literal["pass", "rework", "repair"] = "pass"
     employee_id: str | None = None
+    # 实际做这次质检的人，与 employee_id（第一位负责人 / 损耗归属）不是一回事。
+    # 小程序端由后端从登录态强制填入，不接受客户端传值（否则能替别人记功）。
+    inspector_id: str | None = None
     remark: str = ""
     # 负责人（多选）。同一次判定产生的单据共用这份名单。
     # owners 同时承载「报废单」的工时与物料损失；
@@ -152,4 +155,6 @@ class QcInspectionOut(BaseModel):
     remark: str = ""
     employee_id: str | None = None
     employee_name: str = ""
+    inspector_id: str | None = None
+    inspector_name: str = ""
     created_at: datetime

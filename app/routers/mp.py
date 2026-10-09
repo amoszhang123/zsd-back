@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
+from typing import Literal
 
 import qrcode
 from fastapi import APIRouter, Depends, File, HTTPException, Header, UploadFile
@@ -26,6 +27,7 @@ from app.models.order import (
 )
 from app.models.production import (
     POSITION_PROGRAMMER,
+    POSITION_QC,
     WORK_ORDER_STATUS_DONE,
     Employee,
     OrderContribution,
@@ -38,16 +40,20 @@ from app.models.production import (
 from app.models.quality import (
     DISPOSITION_COST_LABELS,
     DISPOSITION_TYPE_LABELS,
+    STAGES,
     STAGE_LABELS,
     DispositionOwner,
+    QcInspection,
     RepairOrder,
     ReworkOrder,
     ScrapOrder,
 )
 from app.program_sheet import ProgramSheetError, parse_program_sheet
 from app.routers.auth import TOKENS
-from app.routers.production import complete_work, startable_error
+from app.routers.production import complete_work, list_order_employees, startable_error
+from app.routers.quality import pending_qty, stage_pending_map, submit_judgment
 from app.schemas.production import CompleteWorkItem, CompleteWorkRequest, ContributionIn
+from app.schemas.quality import OwnerIn, QcJudgmentRequest, Stage
 
 router = APIRouter(prefix="/api/mp", tags=["mp"])
 
@@ -794,6 +800,8 @@ def complete_my_work_order(
 
 PROGRAM_STATE_PENDING = "待编程"
 PROGRAM_STATE_DONE = "已编程"
+QC_STATE_PENDING = "待质检"
+QC_STATE_DONE = "已质检"
 
 
 class MpMyOrderOut(BaseModel):
@@ -808,28 +816,83 @@ class MpMyOrderOut(BaseModel):
     status: str = ""
     # 编程维度：待编程 / 已编程 / ""（还没走到程序阶段）
     program_state: str = ""
-    # 列表「订单状态」那一列显示它：编程岗看待编程/已编程才有意义，其余看流水线状态
+    # 质检维度：待质检 / 已质检 / ""（非质检岗、或这单与质检无关）
+    qc_state: str = ""
+    qc_stage: str = ""
+    qc_stage_label: str = ""
+    qc_pending_qty: int = 0
+    # 列表「订单状态」那一列显示它：编程岗看待编程/已编程、质检岗看待质检/已质检
+    # 才有意义，其余情况看流水线状态
     display_status: str = ""
     machining_minutes: float | None = None
     estimated_hours: float = 0
     # True → 小程序里显示绿色的「编辑」按钮
     can_edit: bool = False
+    # True → 显示绿色的「判定」按钮
+    can_judge: bool = False
     programmers: list[str] = []
 
 
 class MpMyOrderListOut(BaseModel):
     orders: list[MpMyOrderOut] = []
     is_programmer: bool = False
+    is_qc: bool = False
     pending_count: int = 0
     programmed_count: int = 0
+    # 质检岗用这两个；编程岗看上面两个
+    qc_pending_count: int = 0
+    qc_done_count: int = 0
+
+
+class MpQcStageOut(BaseModel):
+    """某个质检阶段的待检情况。前端据此决定判定页里能选哪些阶段。"""
+
+    stage: str
+    label: str = ""
+    upstream_qty: int = 0
+    inspected_qty: int = 0
+    pending_qty: int = 0
+
+
+class MpOwnerCandidateOut(BaseModel):
+    """可选的工单负责人（做过这张订单的员工），带出参与度帮着分配损耗。"""
+
+    employee_id: str
+    employee_name: str = ""
+    percent: int | None = None
+
+
+class MpInspectionOut(BaseModel):
+    """这张订单上已有的一条质检批次记录。"""
+
+    id: int
+    stage: str
+    stage_label: str = ""
+    quantity: int = 0
+    pass_count: int = 0
+    fail_count: int = 0
+    scrap_qty: int = 0
+    verdict: str = ""
+    remark: str = ""
+    inspector_id: str | None = None
+    inspector_name: str = ""
+    # 是不是当前登录的质检员做的
+    is_mine: bool = False
+    created_at: datetime | None = None
 
 
 class MpOrderDetailOut(BaseModel):
+    """小程序端的订单详情。
+
+    **刻意不含客户名称、单价、金额等商务字段** —— 小程序是给车间员工用的，
+    这些不该让他们看到。注意不能只在前端不渲染：接口照样返回的话，抓包或
+    开发者工具里就直接看到了，所以从 schema 层就不给。
+    """
+
     order_id: str
     order_no: str = ""
     project_no: str = ""
     material_no: str = ""
-    customer: str = ""
     product: str = ""
     model: str = ""
     quantity: int = 0
@@ -837,12 +900,51 @@ class MpOrderDetailOut(BaseModel):
     order_type: str = ""
     status: str = ""
     program_state: str = ""
+    qc_state: str = ""
     create_date: date | None = None
     deadline: date | None = None
     machining_minutes: float | None = None
     estimated_hours: float = 0
     can_edit: bool = False
+    can_judge: bool = False
+    # 待检的那个阶段，判定页默认用它
+    qc_stage: str = ""
+    qc_stage_label: str = ""
+    qc_pending_qty: int = 0
     programmers: list[str] = []
+    qc_stages: list[MpQcStageOut] = []
+    owner_candidates: list[MpOwnerCandidateOut] = []
+    inspections: list[MpInspectionOut] = []
+
+
+class MpJudgmentRequest(BaseModel):
+    """小程序端的质检判定入参，字段与 web 端 QcJudgmentDialog 提交的一致。
+
+    比 QcJudgmentRequest 少了 order_id（走路径）和 inspector_id（后端从登录态取）。
+    """
+
+    stage: Stage
+    quantity: int | None = Field(default=None, gt=0)
+    scrap_qty: int = Field(default=0, ge=0)
+    verdict: Literal["pass", "rework", "repair"] = "pass"
+    remark: str = ""
+    owners: list[OwnerIn] = []
+    return_owners: list[OwnerIn] = []
+
+
+class MpJudgmentResultOut(BaseModel):
+    """判定结果 + 刷新后的订单详情，省一次往返。"""
+
+    message: str = ""
+    qc_status: str = ""
+    inspected_qty: int = 0
+    scrap_qty: int = 0
+    passed_qty: int = 0
+    rejected_qty: int = 0
+    pending_qty: int = 0
+    returned_to_production: bool = False
+    created_docs: list[str] = []
+    detail: MpOrderDetailOut
 
 
 class MpProgramTimeRequest(BaseModel):
@@ -895,6 +997,41 @@ def _require_programmer(emp: Employee) -> None:
         )
 
 
+def _require_qc(emp: Employee) -> None:
+    if emp.position != POSITION_QC:
+        raise HTTPException(
+            403,
+            f"只有「{POSITION_QC}」岗位可以做质检判定，你当前岗位是「{emp.position}」",
+        )
+
+
+def _qc_pending_by_order(db: Session) -> dict[str, tuple[str, int]]:
+    """订单 → (待检阶段, 待检数量)。
+
+    口径直接复用 quality.stage_pending_map，也就是 web 端待检队列用的那套
+    （待检 = 上游产出 − 本阶段已检），两端不会出现「一边算待检一边算检完」。
+    流水线是顺序的，一张订单正常只有一个阶段在等检；真出现多个时取靠前的那个
+    —— STAGES 本身就按流水线顺序排。
+    """
+    out: dict[str, tuple[str, int]] = {}
+    for stage in STAGES:
+        for order_id, qty in stage_pending_map(db, stage).items():
+            out.setdefault(order_id, (stage, qty))
+    return out
+
+
+def _my_inspected_order_ids(db: Session, employee_id: str) -> set[str]:
+    """我作为质检员检过的订单。按 inspector_id 查，不是 employee_id ——
+    后者存的是报废/返工的第一位负责人，跟谁做的质检没关系。"""
+    rows = (
+        db.query(QcInspection.order_id)
+        .filter(QcInspection.inspector_id == employee_id)
+        .distinct()
+        .all()
+    )
+    return {row[0] for row in rows}
+
+
 def _remember_programmer(db: Session, order_id: str, employee_id: str) -> None:
     """记下「这人编程过这张单」。(order_id, employee_id) 有唯一约束，重复保存不再插。"""
     exists = (
@@ -926,10 +1063,13 @@ def _programmers_map(db: Session, order_ids: list[str]) -> dict[str, list[str]]:
     return out
 
 
-def _my_order_ids(db: Session, emp: Employee) -> list[str]:
-    """「我的订单」的取数口径。
+def _my_order_ids(
+    db: Session, emp: Employee, qc_pending: dict[str, tuple[str, int]] | None = None
+) -> list[str]:
+    """「我的订单」的取数口径，按岗位分三种。
 
     编程岗：所有待编程的订单（还没人接的活，谁都能领）+ 我参与编程过的订单。
+    质检岗：所有待质检的订单 + 我质检过的订单。
     其它岗：我参与生产过的订单（order_contributions 里有我的记录）。
     """
     if emp.position == POSITION_PROGRAMMER:
@@ -951,6 +1091,11 @@ def _my_order_ids(db: Session, emp: Employee) -> list[str]:
         # 两个集合可能重叠（我刚编程完、它还停在程序阶段），去重保序
         return list(dict.fromkeys(pending + programmed))
 
+    if emp.position == POSITION_QC:
+        # qc_pending 允许调用方传进来复用，列表接口已经算过一遍了，别再算第二次
+        wait = qc_pending if qc_pending is not None else _qc_pending_by_order(db)
+        return list(dict.fromkeys(list(wait) + sorted(_my_inspected_order_ids(db, emp.id))))
+
     return [
         row[0]
         for row in db.query(OrderContribution.order_id)
@@ -969,14 +1114,54 @@ def _visible_order(db: Session, order_id: str, emp: Employee) -> Order:
     return order
 
 
-def _order_detail(db: Session, order: Order) -> MpOrderDetailOut:
+def _order_detail(db: Session, order: Order, emp: Employee) -> MpOrderDetailOut:
     status = resolve_order_status(order, in_production_order_ids(db, [order.id]))
+    is_qc = emp.position == POSITION_QC
+
+    qc_stage = ""
+    qc_pending_qty = 0
+    qc_stages: list[MpQcStageOut] = []
+    qc_state = ""
+    owner_candidates: list[MpOwnerCandidateOut] = []
+    if is_qc:
+        # 三个阶段的待检情况都带上，判定页据此列出可选阶段（通常只有一个有待检）
+        for stage in STAGES:
+            upstream, left = pending_qty(db, order.id, stage)
+            qc_stages.append(
+                MpQcStageOut(
+                    stage=stage,
+                    label=STAGE_LABELS[stage],
+                    upstream_qty=upstream,
+                    inspected_qty=max(0, upstream - left),
+                    pending_qty=left,
+                )
+            )
+            if not qc_stage and left > 0:
+                qc_stage, qc_pending_qty = stage, left
+        owner_candidates = [
+            MpOwnerCandidateOut(
+                employee_id=c.employee_id, employee_name=c.employee_name, percent=c.percent
+            )
+            for c in list_order_employees(order.id, db)
+        ]
+
+    batches = (
+        db.query(QcInspection)
+        .filter(QcInspection.order_id == order.id)
+        .order_by(QcInspection.created_at, QcInspection.id)
+        .all()
+    )
+    if is_qc:
+        if qc_pending_qty > 0:
+            qc_state = QC_STATE_PENDING
+        elif any(b.inspector_id == emp.id for b in batches):
+            qc_state = QC_STATE_DONE
+
     return MpOrderDetailOut(
         order_id=order.id,
         order_no=order.order_no,
         project_no=order.project_no,
         material_no=order.material_no,
-        customer=order.customer,
         product=order.product,
         model=order.model,
         quantity=order.quantity,
@@ -984,20 +1169,57 @@ def _order_detail(db: Session, order: Order) -> MpOrderDetailOut:
         order_type=order.order_type,
         status=status,
         program_state=_program_state(order),
+        qc_state=qc_state,
         create_date=order.create_date,
         deadline=order.deadline,
         machining_minutes=order.machining_minutes,
         estimated_hours=order.estimated_hours,
-        can_edit=_can_edit_program(order),
+        # 绿色编辑按钮只给编程岗，否则质检员会看到一个点了就 403 的按钮
+        can_edit=_can_edit_program(order) and emp.position == POSITION_PROGRAMMER,
+        can_judge=is_qc and qc_pending_qty > 0,
+        qc_stage=qc_stage,
+        qc_stage_label=STAGE_LABELS.get(qc_stage, ""),
+        qc_pending_qty=qc_pending_qty,
         programmers=_programmers_map(db, [order.id]).get(order.id, []),
+        qc_stages=qc_stages,
+        owner_candidates=owner_candidates,
+        inspections=[
+            MpInspectionOut(
+                id=b.id,
+                stage=b.stage,
+                stage_label=STAGE_LABELS.get(b.stage, b.stage),
+                quantity=b.quantity,
+                pass_count=b.pass_count,
+                fail_count=b.fail_count,
+                scrap_qty=b.scrap_qty,
+                verdict=b.verdict,
+                remark=b.remark,
+                inspector_id=b.inspector_id,
+                inspector_name=b.inspector.name if b.inspector else "",
+                is_mine=b.inspector_id == emp.id,
+                created_at=b.created_at,
+            )
+            for b in batches
+        ],
     )
 
 
 @router.get("/my-orders", response_model=MpMyOrderListOut)
 def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
-    """我涉及的订单。编程岗看到的是「所有待编程 + 我编程过的」。"""
+    """我涉及的订单，按岗位分口径：
+
+    编程岗 = 所有待编程 + 我编程过的；质检岗 = 所有待质检 + 我质检过的；
+    其它岗 = 我参与生产过的。
+    """
     emp = _current_employee(user, db)
-    ids = _my_order_ids(db, emp)
+    is_programmer = emp.position == POSITION_PROGRAMMER
+    is_qc = emp.position == POSITION_QC
+
+    # 待检映射算一次，_my_order_ids 和下面的行构造共用，别重复扫三张表
+    qc_pending = _qc_pending_by_order(db) if is_qc else {}
+    my_inspected = _my_inspected_order_ids(db, emp.id) if is_qc else set()
+
+    ids = _my_order_ids(db, emp, qc_pending)
     orders = db.query(Order).filter(Order.id.in_(ids)).all() if ids else []
     orders.sort(key=lambda o: (o.create_date or date.min, o.id), reverse=True)
 
@@ -1007,7 +1229,17 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
     items = []
     for o in orders:
         status = resolve_order_status(o, producing)
-        state = _program_state(o)
+        program_state = _program_state(o) if is_programmer else ""
+        qc_state = ""
+        qc_stage = ""
+        qc_qty = 0
+        if is_qc:
+            hit = qc_pending.get(o.id)
+            if hit:
+                qc_state = QC_STATE_PENDING
+                qc_stage, qc_qty = hit
+            elif o.id in my_inspected:
+                qc_state = QC_STATE_DONE
         items.append(
             MpMyOrderOut(
                 order_id=o.id,
@@ -1016,26 +1248,34 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
                 model=o.model,
                 quantity=o.quantity,
                 status=status,
-                program_state=state,
-                display_status=state or status,
+                program_state=program_state,
+                qc_state=qc_state,
+                qc_stage=qc_stage,
+                qc_stage_label=STAGE_LABELS.get(qc_stage, ""),
+                qc_pending_qty=qc_qty,
+                display_status=qc_state or program_state or status,
                 machining_minutes=o.machining_minutes,
                 estimated_hours=o.estimated_hours,
-                can_edit=_can_edit_program(o),
+                can_edit=_can_edit_program(o) and is_programmer,
+                can_judge=qc_state == QC_STATE_PENDING,
                 programmers=programmers.get(o.id, []),
             )
         )
     return MpMyOrderListOut(
         orders=items,
-        is_programmer=emp.position == POSITION_PROGRAMMER,
+        is_programmer=is_programmer,
+        is_qc=is_qc,
         pending_count=sum(1 for i in items if i.program_state == PROGRAM_STATE_PENDING),
         programmed_count=sum(1 for i in items if i.program_state == PROGRAM_STATE_DONE),
+        qc_pending_count=sum(1 for i in items if i.qc_state == QC_STATE_PENDING),
+        qc_done_count=sum(1 for i in items if i.qc_state == QC_STATE_DONE),
     )
 
 
 @router.get("/orders/{order_id}", response_model=MpOrderDetailOut)
 def my_order_detail(order_id: str, user=Depends(_get_mp_user), db: Session = Depends(get_db)):
     emp = _current_employee(user, db)
-    return _order_detail(db, _visible_order(db, order_id, emp))
+    return _order_detail(db, _visible_order(db, order_id, emp), emp)
 
 
 @router.post("/orders/{order_id}/program-sheet", response_model=MpProgramSheetOut)
@@ -1100,4 +1340,52 @@ def save_program_time(
     _remember_programmer(db, order.id, emp.id)
     db.commit()
     db.refresh(order)
-    return _order_detail(db, order)
+    return _order_detail(db, order, emp)
+
+
+@router.post("/orders/{order_id}/judgment", response_model=MpJudgmentResultOut)
+def submit_my_judgment(
+    order_id: str,
+    req: MpJudgmentRequest,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    """质检判定。判定逻辑全部复用 web 端那个 submit_judgment，不另写一套：
+    报废/返工/维修单、损耗负责人、整批打回投产、合格后推进下一阶段，口径完全一致。
+
+    差别只有一个：inspector_id 一律取登录态，不接受前端传 —— 否则能替别人记功，
+    「我已质检过的订单」这个列表也就不可信了。
+    """
+    emp = _current_employee(user, db)
+    _require_qc(emp)
+    order = _visible_order(db, order_id, emp)
+
+    result = submit_judgment(
+        QcJudgmentRequest(
+            order_id=order.id,
+            stage=req.stage,
+            quantity=req.quantity,
+            scrap_qty=req.scrap_qty,
+            verdict=req.verdict,
+            # 与 web 端 QcJudgmentDialog 一致：employee_id 这个历史单选列取第一位负责人
+            employee_id=req.owners[0].employee_id if req.owners else None,
+            inspector_id=emp.id,
+            remark=req.remark,
+            owners=req.owners,
+            return_owners=req.return_owners,
+        ),
+        db,
+    )
+    db.refresh(order)
+    return MpJudgmentResultOut(
+        message=result.message,
+        qc_status=result.qc_status,
+        inspected_qty=result.inspected_qty,
+        scrap_qty=result.scrap_qty,
+        passed_qty=result.passed_qty,
+        rejected_qty=result.rejected_qty,
+        pending_qty=result.pending_qty,
+        returned_to_production=result.returned_to_production,
+        created_docs=result.created_docs,
+        detail=_order_detail(db, order, emp),
+    )

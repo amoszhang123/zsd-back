@@ -124,7 +124,17 @@ class QcInspection(Base):
     employee_id: Mapped[str | None] = mapped_column(
         String(10), ForeignKey("employees.id"), nullable=True
     )
+    # 实际做这次质检的人。和 employee_id 不是一回事：employee_id 存的是「第一位
+    # 负责人」（报废/返工/维修的损耗归属，见 web 端 QcJudgmentDialog 的注释），
+    # inspector_id 才是质检员本人。小程序「我的订单」里「我已质检过的订单」按它查，
+    # 由后端从登录态写入，不接受前端传（否则能替别人记功）。
+    inspector_id: Mapped[str | None] = mapped_column(
+        String(10), ForeignKey("employees.id"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
 
     order: Mapped["Order"] = relationship()
-    employee: Mapped["Employee | None"] = relationship()
+    # 两个外键都指向 employees，必须各自显式指定 foreign_keys，否则 SQLAlchemy
+    # 无法判断该用哪一列，两个 relationship 都会报 ambiguous
+    employee: Mapped["Employee | None"] = relationship(foreign_keys=[employee_id])
+    inspector: Mapped["Employee | None"] = relationship(foreign_keys=[inspector_id])

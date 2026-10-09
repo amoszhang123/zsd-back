@@ -1,0 +1,44 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: zsd-db
+    restart: always
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - appnet
+
+  web:
+    build: .
+    container_name: zsd-web
+    restart: always
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    networks:
+      - appnet
+      - npm_net
+
+volumes:
+  mysql_data:
+
+networks:
+  appnet:
+    driver: bridge
+  npm_net:
+    external: true
+    name: nginx-proxy-manage_default
