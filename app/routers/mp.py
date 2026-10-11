@@ -5,12 +5,13 @@ import json
 import secrets
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
 from typing import Literal
 
 import qrcode
-from fastapi import APIRouter, Depends, File, HTTPException, Header, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Header, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
@@ -27,6 +28,7 @@ from app.models.order import (
 )
 from app.models.production import (
     POSITION_ADMIN,
+    POSITION_OPERATOR,
     POSITION_PROGRAMMER,
     POSITION_QC,
     WORK_ORDER_STATUS_DONE,
@@ -50,6 +52,7 @@ from app.models.quality import (
     ScrapOrder,
 )
 from app.program_sheet import ProgramSheetError, parse_program_sheet
+from app.quote_excel import XLSX_MIME, QuoteExportError, build_quote_xlsx, quote_filename
 from app.routers.auth import TOKENS
 from app.routers.contracts import (
     get_contract,
@@ -57,6 +60,14 @@ from app.routers.contracts import (
     list_contracts,
     update_contract_item_quantity,
     update_contract_status,
+)
+from app.routers.orders import (
+    batch_confirm,
+    confirm_order,
+    create_order,
+    get_order,
+    list_orders,
+    update_order,
 )
 from app.routers.production import complete_work, list_order_employees, startable_error
 from app.routers.quality import pending_qty, stage_pending_map, submit_judgment
@@ -73,6 +84,13 @@ from app.schemas.contract import (
     ContractItemQuantityUpdate,
     ContractStatusUpdate,
     ContractSummary,
+)
+from app.schemas.order import (
+    BatchConfirmRequest,
+    BatchConfirmResponse,
+    OrderCreate,
+    OrderResponse,
+    OrderUpdate,
 )
 from app.schemas.production import CompleteWorkItem, CompleteWorkRequest, ContributionIn
 from app.schemas.quality import OwnerIn, QcJudgmentRequest, Stage
@@ -113,6 +131,10 @@ class EmployeeQrResponse(BaseModel):
     employee_id: str
     name: str
     qr_image: str
+    # 二维码里承载的签名 token，以及它还能用多少秒。
+    # 小程序按 expires_in 倒计时，归零就重新请求本接口换新码。
+    token: str = ""
+    expires_in: int = 0
 
 
 class VerifyQrRequest(BaseModel):
@@ -123,6 +145,20 @@ class VerifyQrResponse(BaseModel):
     valid: bool
     employee_id: str = ""
     name: str = ""
+
+
+# 员工二维码是「谁在干活」的身份凭证，web 端开工/完工靠扫它确认身份。
+# 所以必须短时效 + 签名：编码裸工号的话，拍一张照片就能永久冒充那个人。
+QR_TOKEN_TTL = 60     # 小程序上显示的倒计时秒数
+QR_TOKEN_GRACE = 10   # 额外宽限：扫码到调 verify-qr 之间有网络往返，
+#                     # 卡在第 59 秒扫的码不该在验证时被判过期
+QR_TOKEN_LEN = 32
+
+
+def _mint_qr_token(emp: Employee, ts: int) -> str:
+    """签发员工二维码 token：sha256(工号:姓名:签发秒:密钥) 的前 32 位十六进制。"""
+    raw = f"{emp.id}:{emp.name}:{ts}:{settings.qr_secret}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:QR_TOKEN_LEN]
 
 
 def _get_mp_user(authorization: str = Header("")):
@@ -275,32 +311,46 @@ def _render_qr_data_uri(text: str) -> str:
 
 @router.get("/employee-qr", response_model=EmployeeQrResponse)
 def get_employee_qr(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    """签发一张 60 秒时效的员工二维码。
+
+    二维码内容是签名 token 而不是工号，web 端扫到后必须调 /mp/verify-qr 换身份，
+    过期即失效。小程序按 expires_in 倒计时，归零重新请求本接口。
+    """
     phone = user.get("phone", "")
     emp = db.query(Employee).filter(Employee.phone == phone).first()
     if not emp:
         raise HTTPException(404, "未绑定员工")
 
+    token = _mint_qr_token(emp, int(time.time()))
     return EmployeeQrResponse(
         employee_id=emp.id,
         name=emp.name,
-        qr_image=_render_qr_data_uri(emp.id),
+        qr_image=_render_qr_data_uri(token),
+        token=token,
+        expires_in=QR_TOKEN_TTL,
     )
 
 
 @router.post("/verify-qr", response_model=VerifyQrResponse)
 def verify_qr(req: VerifyQrRequest, db: Session = Depends(get_db)):
-    parts_check = req.token
-    if len(parts_check) != 32:
+    """校验员工二维码 token，换出员工身份。web 端扫到码后调这里。
+
+    有效期 QR_TOKEN_TTL 秒，另加 QR_TOKEN_GRACE 秒宽限给「扫码 → 调本接口」的
+    网络往返，否则卡在第 59 秒扫的码会在验证时被判过期。
+
+    token 是单向哈希，反推不出工号，只能拿每个员工 × 每个候选秒数去撞。
+    员工数 × 70 次 sha256，几十上百人规模是亚毫秒级；真到上万员工再改成
+    「二维码里带明文工号、只校验那一个员工」的形式。
+    """
+    token = (req.token or "").strip()
+    if len(token) != QR_TOKEN_LEN:
         return VerifyQrResponse(valid=False)
 
     now = int(time.time())
-    emps = db.query(Employee).all()
-    for emp in emps:
-        for offset in range(0, 120, 1):
-            ts = now - offset
-            raw = f"{emp.id}:{emp.name}:{ts}:factory_qr_secret"
-            expected = hashlib.sha256(raw.encode()).hexdigest()[:32]
-            if expected == req.token:
+    oldest = now - (QR_TOKEN_TTL + QR_TOKEN_GRACE)
+    for emp in db.query(Employee).all():
+        for ts in range(now, oldest - 1, -1):
+            if _mint_qr_token(emp, ts) == token:
                 return VerifyQrResponse(valid=True, employee_id=emp.id, name=emp.name)
 
     return VerifyQrResponse(valid=False)
@@ -504,6 +554,24 @@ class MpScanRequest(BaseModel):
     content: str = Field(min_length=1, max_length=500)
 
 
+class MpQuickScanOut(BaseModel):
+    """快捷扫码的分流结果。前端按 action 决定跳转还是弹窗。"""
+
+    position: str
+    order_id: str
+    order_no: str = ""
+    status: str = ""
+    current_step: int = 0
+    # work_order_added 操作工已把订单加进开工单（现有的或新建的）
+    # program          编程，可跳「订单程序时间」页
+    # qc               质检，可跳「质检判定」页
+    # reject           不满足加单/跳转条件，message 为提醒文案
+    action: str
+    work_order_id: int | None = None
+    work_order_is_new: bool = False
+    message: str = ""
+
+
 class MpCompleteItem(BaseModel):
     order_id: str
     completed_qty: int = Field(default=0, ge=0)
@@ -542,6 +610,48 @@ def _open_work_order(db: Session, employee_id: str) -> WorkOrder | None:
         .order_by(WorkOrder.id.desc())
         .first()
     )
+
+
+def _new_work_order(db: Session, emp: Employee) -> WorkOrder:
+    """建一张空开工单。订单随后扫码逐个加，建单时不校验订单。"""
+    today = date.today()
+    work_order = WorkOrder(work_date=today)
+    work_order.employees = [WorkOrderEmployee(employee_id=emp.id, work_date=today)]
+    db.add(work_order)
+    db.commit()
+    db.refresh(work_order)
+    return work_order
+
+
+def _get_or_create_open_work_order(db: Session, emp: Employee) -> tuple[WorkOrder, bool]:
+    """快捷扫码用：有未完工的就用现有的，没有就新开一张。返回 (开工单, 是否新建)。"""
+    existing = _open_work_order(db, emp.id)
+    if existing:
+        return existing, False
+    return _new_work_order(db, emp), True
+
+
+def _order_add_error(db: Session, order: Order) -> str | None:
+    """与开工单无关的加单校验（订单阶段 / 合同状态），返回错误文案；None 表示通过。"""
+    reason = startable_error([order], "加入开工单")
+    if reason:
+        return reason
+    blocked = blocked_orders(db, [order.id])
+    if blocked:
+        return f"订单 {order.id} 所属合同状态为「{blocked[order.id]}」，不能开工"
+    return None
+
+
+def _work_order_add_error(db: Session, work_order: WorkOrder, order: Order) -> str | None:
+    """把订单加进某张开工单前的全部校验，返回错误文案；None 表示可以加。
+
+    /work-orders/{id}/scan 与 /quick-scan 共用这一份，加单规则不允许有两套。
+    """
+    if work_order.status == WORK_ORDER_STATUS_DONE:
+        return f"开工单 #{work_order.id} 已完工，不能再添加订单"
+    if any(item.order_id == order.id for item in work_order.items):
+        return f"订单 {order.id} 已在本张开工单里，不用重复扫"
+    return _order_add_error(db, order)
 
 
 def _participants_map(db: Session, order_ids: list[str]) -> dict[str, list[MpParticipantOut]]:
@@ -725,13 +835,7 @@ def create_my_work_order(user=Depends(_get_mp_user), db: Session = Depends(get_d
             f"你还有未完工的开工单 #{open_wo.id}（{open_wo.work_date}），必须先完工结单",
         )
 
-    today = date.today()
-    work_order = WorkOrder(work_date=today)
-    work_order.employees = [WorkOrderEmployee(employee_id=emp.id, work_date=today)]
-    db.add(work_order)
-    db.commit()
-    db.refresh(work_order)
-    return _work_order_detail(db, work_order)
+    return _work_order_detail(db, _new_work_order(db, emp))
 
 
 @router.get("/work-orders/{work_order_id}", response_model=MpWorkOrderDetailOut)
@@ -752,8 +856,6 @@ def scan_add_order(
     """扫图纸二维码，把解析出的订单加进本张开工单。"""
     emp = _current_employee(user, db)
     work_order = _owned_work_order(db, work_order_id, emp.id)
-    if work_order.status == WORK_ORDER_STATUS_DONE:
-        raise HTTPException(400, f"开工单 #{work_order.id} 已完工，不能再添加订单")
 
     candidates = _parse_scan_candidates(req.content)
     if not candidates:
@@ -761,23 +863,77 @@ def scan_add_order(
 
     order = _resolve_scanned_order(db, candidates)
 
-    if any(item.order_id == order.id for item in work_order.items):
-        raise HTTPException(400, f"订单 {order.id} 已在本张开工单里，不用重复扫")
-
-    reason = startable_error([order], "加入开工单")
-    if reason:
-        raise HTTPException(400, reason)
-
-    blocked = blocked_orders(db, [order.id])
-    if blocked:
-        raise HTTPException(
-            400, f"订单 {order.id} 所属合同状态为「{blocked[order.id]}」，不能开工"
-        )
+    err = _work_order_add_error(db, work_order, order)
+    if err:
+        raise HTTPException(400, err)
 
     db.add(WorkOrderItem(work_order_id=work_order.id, order_id=order.id))
     db.commit()
     db.refresh(work_order)
     return _work_order_detail(db, work_order)
+
+
+@router.post("/quick-scan", response_model=MpQuickScanOut)
+def quick_scan(req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    """快捷扫码：扫订单二维码，按岗位分流，前端拿 action 决定跳转还是弹窗。
+
+    操作工 → 把订单加进当前未完工开工单（没有就新开一张）；加单规则与
+             /work-orders/{id}/scan 完全一致（同一份 _work_order_add_error）。
+    编程   → 订单已到程序阶段才返回 program，否则 reject 让前端弹窗提醒。
+    质检   → 订单已有待检阶段才返回 qc，否则 reject。
+    程序/质检的放行口径与各目标页面自身一致，避免「跳过去才发现做不了」。
+    """
+    emp = _current_employee(user, db)
+    if emp.position not in (POSITION_OPERATOR, POSITION_PROGRAMMER, POSITION_QC):
+        raise HTTPException(403, f"「{emp.position}」岗位不支持快捷扫码")
+
+    candidates = _parse_scan_candidates(req.content)
+    if not candidates:
+        raise HTTPException(400, "二维码内容为空，识别不出订单")
+    order = _resolve_scanned_order(db, candidates)
+
+    out = MpQuickScanOut(
+        position=emp.position,
+        order_id=order.id,
+        order_no=order.order_no,
+        status=resolve_order_status(order, in_production_order_ids(db, [order.id])),
+        current_step=order.current_step,
+        action="reject",
+    )
+
+    if emp.position == POSITION_OPERATOR:
+        # 与开工单无关的校验先做：不通过就别新建开工单，免得留下一张空单
+        err = _order_add_error(db, order)
+        if err:
+            out.message = err
+            return out
+        work_order, is_new = _get_or_create_open_work_order(db, emp)
+        out.work_order_id = work_order.id
+        out.work_order_is_new = is_new
+        err = _work_order_add_error(db, work_order, order)
+        if err:
+            out.message = err
+            return out
+        db.add(WorkOrderItem(work_order_id=work_order.id, order_id=order.id))
+        db.commit()
+        out.action = "work_order_added"
+        out.message = f"订单 {order.id} 已加入{'新建的' if is_new else ''}开工单 #{work_order.id}"
+        return out
+
+    if emp.position == POSITION_PROGRAMMER:
+        if _program_state(order) == "":
+            out.message = f"订单 {order.id} 当前状态「{out.status}」，还没到程序阶段"
+            return out
+        out.action = "program"
+        return out
+
+    # 质检：与质检判定页同口径 —— 有待检数量的阶段才值得跳过去
+    detail = _order_detail(db, order, emp)
+    if not any(s.pending_qty > 0 for s in detail.qc_stages):
+        out.message = f"订单 {order.id} 当前状态「{out.status}」，还没到质检阶段或当前无待检"
+        return out
+    out.action = "qc"
+    return out
 
 
 @router.post("/work-orders/{work_order_id}/complete", response_model=MpWorkOrderDetailOut)
@@ -1419,6 +1575,37 @@ def mp_quote_history(quote_id: str, user=Depends(_get_mp_user), db: Session = De
     return quote_history(quote_id, db)
 
 
+@router.get("/quotes/{quote_id}/export")
+def mp_export_quote(quote_id: str, user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    """生成报价单 xlsx，作为附件返回。
+
+    小程序用 uni.downloadFile 拿这个 URL，再 uni.openDocument 直接打开。
+    版式由 app/quote_excel.py 保证与 web 端 exportQuote.js 一致。
+    """
+    _require_admin(user, db)
+    quote = get_quote(quote_id, db)
+    try:
+        data = build_quote_xlsx(quote)
+    except QuoteExportError as e:
+        raise HTTPException(400, str(e)) from e
+
+    filename = quote_filename(quote.id)
+    # 文件名含中文，只能用 RFC 5987 的 filename*；直接塞进 filename= 会乱码。
+    # 同时给一个 ASCII 兜底名，照顾不认 filename* 的老客户端。
+    ascii_name = f"quote-{quote.id}.xlsx"
+    return Response(
+        content=data,
+        media_type=XLSX_MIME,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=\"{ascii_name}\"; "
+                f"filename*=UTF-8''{urllib.parse.quote(filename)}"
+            ),
+            "Content-Length": str(len(data)),
+        },
+    )
+
+
 @router.patch("/quotes/{quote_id}/items/{item_id}", response_model=QuoteItemOut)
 def mp_update_quote_item(
     quote_id: str,
@@ -1474,6 +1661,100 @@ def mp_update_contract_item(
 ):
     _require_admin(user, db)
     return update_contract_item_quantity(contract_id, item_id, req, db)
+
+
+# ------------------------------------------------- 接单管理（仅管理员岗位）
+
+
+class MpAdminOrderOut(BaseModel):
+    """接单管理列表项，字段与 web 端接单管理表格的列一一对应。
+
+    额外带上 customer：web 的搜索框支持按客户搜，移动端也是前端过滤，所以得给。
+    刻意不含 steps / materials / quality_results —— 777 张工单带上这些嵌套数据是
+    882KB，精简到这些字段是 233KB，而列表页根本用不到那些嵌套内容。
+    """
+
+    id: str
+    order_no: str = ""
+    contract_id: str = ""
+    project_no: str = ""
+    material_no: str = ""
+    customer: str = ""
+    product: str = ""
+    model: str = ""
+    quantity: int = 0
+    estimated_hours: float = 0
+    priority: str = "普通"
+    order_type: str = "自主"
+    current_step: int = 0
+    status: str = ""
+    create_date: date | None = None
+    deadline: date | None = None
+
+
+@router.get("/admin/orders", response_model=list[MpAdminOrderOut])
+def mp_admin_list_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    """全部工单（精简字段）。
+
+    一次拉全量、搜索/筛选/分页都放前端，和 web 端接单管理完全同构 ——
+    那边也是后端返回全部、前端 Pager 切片，这样筛选和翻页都是零延迟。
+    """
+    _require_admin(user, db)
+    fields = set(MpAdminOrderOut.model_fields)
+    return [
+        MpAdminOrderOut(**{k: v for k, v in row.items() if k in fields})
+        for row in list_orders(search="", priority="", db=db)
+    ]
+
+
+@router.get("/admin/orders/{order_id}", response_model=OrderResponse)
+def mp_admin_get_order(
+    order_id: str, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    """单张工单完整信息。编辑页靠它回填表单（列表接口是精简字段，不够用）。"""
+    _require_admin(user, db)
+    return get_order(order_id, db)
+
+
+@router.post("/admin/orders", response_model=OrderResponse)
+def mp_admin_create_order(
+    data: OrderCreate, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    _require_admin(user, db)
+    return create_order(data, db)
+
+
+@router.put("/admin/orders/{order_id}", response_model=OrderResponse)
+def mp_admin_update_order(
+    order_id: str,
+    data: OrderUpdate,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user, db)
+    return update_order(order_id, data, db)
+
+
+@router.post("/admin/orders/{order_id}/confirm", response_model=OrderResponse)
+def mp_admin_confirm_order(
+    order_id: str, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    """单张接单。已接过的会被 confirm_order 自己拦下（400 + 当前状态）。"""
+    _require_admin(user, db)
+    return confirm_order(order_id, db)
+
+
+@router.post("/admin/orders/batch-confirm", response_model=BatchConfirmResponse)
+def mp_admin_batch_confirm(
+    req: BatchConfirmRequest, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    """批量接单。目标阶段由订单类型 + skip_material 共同决定：
+    自主/半外协勾选「跳过备料阶段」（默认）→ 齐备/程序，不勾选 → 备料中；
+    全外协恒为质检中，开关无效。
+    合同状态非「正常」的、以及不在待确认阶段的都会被跳过并在 skipped 里回报原因。
+    """
+    _require_admin(user, db)
+    return batch_confirm(req, db)
 
 
 @router.post("/orders/{order_id}/judgment", response_model=MpJudgmentResultOut)

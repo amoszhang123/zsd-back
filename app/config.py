@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     wx_app_secret: str = ""
     mp_mock_phone: str = ""
 
+    # 员工二维码 token 的签名密钥（见 routers/mp.py 的 _mint_qr_token）。
+    # 默认值只是为了本地开发方便，**正式环境必须在 .env 里换成随机串** ——
+    # 它写死在源码里，任何能看到代码的人都能伪造出任意员工的二维码。
+    # 换密钥后所有已出示的二维码立即失效，员工端下次刷新会拿到新的，无需迁移。
+    qr_secret: str = "factory_qr_secret"
+
     ship_from_company: str = "苏州展晟达精密科技有限公司"
 
     @property

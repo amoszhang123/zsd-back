@@ -13,11 +13,13 @@ EMPLOYEE_TYPE_DIRECT = "直属员工"
 EMPLOYEE_TYPE_OUTSOURCED = "外包员工"
 EMPLOYEE_TYPES = (EMPLOYEE_TYPE_DIRECT, EMPLOYEE_TYPE_OUTSOURCED)
 
-# 岗位。「编程」「质检」「管理员」三个岗位参与代码判定：
+# 岗位。以下四个岗位参与代码判定：
 #   编程   → 小程序「我的订单」看待编程订单，可填程序时间
 #   质检   → 小程序「我的订单」看待质检订单，可做质检判定
 #   管理员 → 小程序解锁「报价管理」模块（报价单 + 合同全是商务数据）
-# 操作工只是 web 端下拉里的选项，不做逻辑分支。
+# 操作工 / 编程 / 质检三个岗位共用小程序「快捷扫码」模块：扫订单码后按岗位分流
+# （操作工加进开工单、编程跳程序时间、质检跳质检判定）。
+POSITION_OPERATOR = "操作工"
 POSITION_PROGRAMMER = "编程"
 POSITION_QC = "质检"
 POSITION_ADMIN = "管理员"

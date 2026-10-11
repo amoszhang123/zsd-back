@@ -2,7 +2,6 @@ import io
 import time
 from datetime import date, datetime
 
-import qrcode
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
@@ -11,17 +10,18 @@ from app.database import get_db
 from app.models.contract import ContractItem, blocked_orders
 from app.models.order import (
     ORDER_STATUS_LABELS,
-    ORDER_TYPE_TARGET_STEP,
     PROGRAM_STEP,
     STEP_KEYS,
     STEP_LABELS,
     Order,
     OrderStep,
+    batch_confirm_target_step,
     hours_from_machining_minutes,
     resolve_order_status,
 )
 from app.models.production import in_production_order_ids
 from app.models.quality import QcInspection
+from app.order_label import LabelData, order_qr_image, render_label
 from app.schemas.order import (
     BatchConfirmRequest,
     BatchConfirmResponse,
@@ -250,16 +250,18 @@ def import_orders(rows: list[OrderImportRow], db: Session = Depends(get_db)):
 
 @router.post("/batch-confirm", response_model=BatchConfirmResponse)
 def batch_confirm(req: BatchConfirmRequest, db: Session = Depends(get_db)):
-    """批量接单。整批一个订单类型，目标阶段由类型决定：
+    """批量接单。整批一个订单类型，外加一个「跳过备料阶段」开关，
+    目标阶段由 batch_confirm_target_step 统一裁定：
 
-    自主 / 半外协 → 投产中(step 3)；全外协 → 质检中(step 4)。
-    接单之前的阶段（接单/备料/程序，全外协还多一个投产）一律标记为已完成。
+    自主 / 半外协：勾选跳过备料（默认）→ 齐备/程序(step 2)；不勾选 → 备料中(step 1)。
+    全外协：恒为质检中(step 4)，开关对其无效。
+    目标阶段之前的一切阶段一律标记为已完成。
     """
     order_ids = list(dict.fromkeys(req.order_ids))
     orders = db.query(Order).options(joinedload(Order.steps)).filter(Order.id.in_(order_ids)).all()
     by_id = {o.id: o for o in orders}
 
-    target = ORDER_TYPE_TARGET_STEP[req.order_type]
+    target = batch_confirm_target_step(req.order_type, req.skip_material)
     today = date.today()
     confirmed: list[str] = []
     skipped: list[BatchConfirmSkipped] = []
@@ -437,19 +439,38 @@ def get_qrcode(order_id: str, db: Session = Depends(get_db)):
     if not order:
         raise HTTPException(404, "工单不存在")
 
-    import json
-    content = json.dumps({
-        "workOrderNo": order.id,
-        "orderNo": order.order_no,
-        "projectNo": order.project_no,
-    }, ensure_ascii=False)
-
-    qr = qrcode.QRCode(version=1, box_size=10, border=2)
-    qr.add_data(content)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="#001529", back_color="white")
-
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    order_qr_image(order).save(buf, format="PNG")
     buf.seek(0)
     return StreamingResponse(buf, media_type="image/png")
+
+
+@router.get("/{order_id}/label")
+def get_label(order_id: str, db: Session = Depends(get_db)):
+    """订单码标签 PNG（100×70mm @300DPI），供 web 端接单管理预览与打印。
+
+    右上角序号取合同明细 seq，右下角交期取工单 deadline；
+    二维码与 /qrcode 同一份内容，跨「物料编码/物料名称」两行贴在右侧。
+    """
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(404, "工单不存在")
+
+    item = (
+        db.query(ContractItem)
+        .filter(ContractItem.order_id == order.id)
+        .order_by(ContractItem.seq)
+        .first()
+    )
+    data = LabelData(
+        order_no=order.order_no,
+        project_no=order.project_no,
+        model=order.model,
+        material_no=order.material_no,
+        product=order.product,
+        quantity=order.quantity,
+        seq=str(item.seq) if item and item.seq else "",
+        deadline=f"{order.deadline.month}月{order.deadline.day}日" if order.deadline else "",
+    )
+    return StreamingResponse(io.BytesIO(render_label(data, order_qr_image(order))),
+                             media_type="image/png")

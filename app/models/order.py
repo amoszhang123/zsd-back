@@ -75,6 +75,8 @@ QUALITY2_STEP = STEP_KEYS.index("quality2")
 SHIPPING_STEP = STEP_KEYS.index("shipping")
 # 程序阶段下标：只有这一步能填加工时长
 PROGRAM_STEP = STEP_KEYS.index("program")
+# 备料阶段下标：批量接单不跳过备料时停在这里（与单张接单 confirm_order 一致）
+MATERIAL_STEP = STEP_KEYS.index("material")
 
 # 预估工时 × 80% = 加工时长，80% 是加工占整个工时的比例。
 # 加工时长单位是分钟、estimated_hours 单位是小时，所以还要除以 60：
@@ -96,13 +98,18 @@ def hours_from_machining_minutes(minutes: float) -> float:
     return float(hours.quantize(_HOURS_QUANTUM, rounding=ROUND_HALF_UP))
 
 
-# 接单后各类型直接落到的阶段。
-# 全外协不在厂内生产，跳过投产直接进质检1；自主与半外协都要在厂内开工。
-ORDER_TYPE_TARGET_STEP = {
-    ORDER_TYPE_SELF: PRODUCTION_STEP,
-    ORDER_TYPE_HALF_OUTSOURCE: PRODUCTION_STEP,
-    ORDER_TYPE_FULL_OUTSOURCE: QUALITY1_STEP,
-}
+def batch_confirm_target_step(order_type: str, skip_material: bool = True) -> int:
+    """批量接单后工单落到的阶段。
+
+    全外协不在厂内生产，恒进质检1，skip_material 对它无效。
+
+    自主 / 半外协：
+      跳过备料（默认勾选）→ 停在程序阶段，备料标记为已完成，等编程人员填加工时长；
+      不跳过备料          → 停在备料阶段，与单张接单一致，领料后再往下流转。
+    """
+    if order_type == ORDER_TYPE_FULL_OUTSOURCE:
+        return QUALITY1_STEP
+    return PROGRAM_STEP if skip_material else MATERIAL_STEP
 
 
 def resolve_order_status(order: "Order", in_production_ids: set[str] | None = None) -> str:

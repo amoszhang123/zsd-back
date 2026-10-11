@@ -11,4 +11,9 @@ python-multipart>=0.0.9
 # 解析 CAM 软件导出的钢料设定单（老式二进制 .xls），累加「时间」列得到程序时间。
 # xlrd 2.x 只支持 .xls、不支持 .xlsx，正好匹配图纸模板的格式。
 xlrd>=2.0,<3
+# 后端生成报价单 xlsx。原先是小程序 web-view 里的 H5 用 SheetJS 生成再 blob 下载，
+# 但微信内置浏览器禁 blob 下载、iOS Safari 对 blob 的 download 属性也是坏的
+# （WebKit #190351，文件名会变 Unknown），所以改成后端出附件、
+# 小程序 downloadFile + openDocument 原生打开。
+openpyxl>=3.1,<4
 gunicorn>=23.0.0

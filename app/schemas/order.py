@@ -58,9 +58,12 @@ class OrderCreate(BaseModel):
     order_no: str = ""
     project_no: str = ""
     material_no: str = ""
-    product: str
+    # 必填且不能是空串。web 与小程序的表单都在前端拦了，但直接调接口能绕过，
+    # 而一张没有品名的工单在列表、送货单、扫码解析里全是「—」，等于废数据。
+    product: str = Field(min_length=1)
     model: str = ""
-    quantity: int = 0
+    # 不能为负：下游的累计完工数、质检待检数量都拿它当基数，负数会算出负的待检量。
+    quantity: int = Field(default=0, ge=0)
     # 不再接受 estimated_hours：预估工时只能由程序阶段填的加工时长算出
     priority: str = "普通"
 
@@ -69,9 +72,11 @@ class OrderUpdate(BaseModel):
     order_no: str | None = None
     project_no: str | None = None
     material_no: str | None = None
-    product: str | None = None
+    # None 表示「这次不改这个字段」（update_order 用 exclude_unset），
+    # 所以约束只在真的传了值时生效：传空串 / 负数一样要被挡下来。
+    product: str | None = Field(default=None, min_length=1)
     model: str | None = None
-    quantity: int | None = None
+    quantity: int | None = Field(default=None, ge=0)
     # 同上，预估工时不从这里改
     priority: str | None = None
 
@@ -91,9 +96,14 @@ class OrderImportRow(BaseModel):
 
 class BatchConfirmRequest(BaseModel):
     order_ids: list[str] = Field(min_length=1)
-    # 整批一个类型：自主/半外协 → 投产中，全外协 → 质检中。
-    # 原来的 skip_to_production 已移除，目标阶段完全由类型决定。
+    # 整批一个订单类型。目标阶段由类型 + skip_material 共同决定，
+    # 见 batch_confirm_target_step。
     order_type: Literal["自主", "全外协", "半外协"] = "自主"
+    # 默认 True：跳过备料，工单停在程序阶段（备料标记为已完成）。
+    # False：不跳过，停在备料阶段，与单张接单一致。
+    # 前端两处（web OrderList / 小程序 orderIntake）都是默认勾选。
+    # 全外协忽略此参数，恒进质检1。
+    skip_material: bool = True
 
 
 class BatchConfirmSkipped(BaseModel):
