@@ -30,7 +30,7 @@ services:
     ports:
       - "8000:8000"
     networks:
-      - appnet
+      appnet:
       npm_net:
         ipv4_address: 172.18.0.10
 
