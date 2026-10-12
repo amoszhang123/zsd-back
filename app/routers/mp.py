@@ -107,7 +107,7 @@ router = APIRouter(prefix="/api/mp", tags=["mp"])
 
 DISPOSITION_MODELS = {"rework": ReworkOrder, "scrap": ScrapOrder, "repair": RepairOrder}
 
-WX_TOKEN_URL = "https://api.weixin.qq.com/cgi-bin/token"
+WX_TOKEN_URL = "https://api.weixin.qq.com/cgi-bin/stable_token"
 WX_PHONE_URL = "https://api.weixin.qq.com/wxa/business/getuserphonenumber"
 
 _access_token_cache: dict[str, object] = {"token": "", "expires_at": 0.0}
@@ -184,17 +184,21 @@ def _wx_request(url: str, payload: dict | None = None) -> dict:
 def _get_access_token() -> str:
     if _access_token_cache["token"] and _access_token_cache["expires_at"] > time.time() + 60:
         return str(_access_token_cache["token"])
-
+    # 用稳定版接口：POST + JSON；force_refresh=False 保证多实例/多次调用不会互相顶掉 token
     data = _wx_request(
-        f"{WX_TOKEN_URL}?grant_type=client_credential"
-        f"&appid={settings.wx_appid}&secret={settings.wx_app_secret}"
+        WX_TOKEN_URL,
+        {
+            "grant_type": "client_credential",
+            "appid": settings.wx_appid,
+            "secret": settings.wx_app_secret,
+            "force_refresh": False,
+        },
     )
     token = data.get("access_token")
     if not token:
         raise HTTPException(
             502, f"获取微信 access_token 失败: {data.get('errmsg')} (errcode={data.get('errcode')})"
         )
-
     _access_token_cache["token"] = token
     _access_token_cache["expires_at"] = time.time() + int(data.get("expires_in", 7200))
     return str(token)
