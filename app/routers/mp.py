@@ -53,7 +53,7 @@ from app.models.quality import (
 )
 from app.program_sheet import ProgramSheetError, parse_program_sheet
 from app.quote_excel import XLSX_MIME, QuoteExportError, build_quote_xlsx, quote_filename
-from app.routers.auth import TOKENS
+from app.routers.auth import _get_token, _set_token
 from app.routers.contracts import (
     get_contract,
     import_contract,
@@ -163,7 +163,7 @@ def _mint_qr_token(emp: Employee, ts: int) -> str:
 
 def _get_mp_user(authorization: str = Header("")):
     token = authorization.replace("Bearer ", "")
-    info = TOKENS.get(token)
+    info = _get_token(token)
     if not info:
         raise HTTPException(401, "未登录")
     return info
@@ -233,13 +233,13 @@ def wx_login(req: WxLoginRequest):
         raise HTTPException(503, "未配置 WX_APPID/WX_APP_SECRET，也未配置 MP_MOCK_PHONE")
 
     token = secrets.token_hex(24)
-    TOKENS[token] = {
+    _set_token(token, {               # 原来 TOKENS[token] = {...}
         "username": phone,
         "name": phone,
         "role": "employee",
         "phone": phone,
-        "expires": datetime.now() + timedelta(hours=24),
-    }
+        "expires": (datetime.now() + timedelta(hours=24)).isoformat(),
+    })
     return WxLoginResponse(token=token, phone=phone)
 
 
