@@ -31,7 +31,7 @@ services:
       - "8000:8000"
     networks:
       - appnet
-      npm_net
+      npm_net:
         ipv4_address: 172.18.0.10
 
 volumes:
