@@ -215,10 +215,16 @@ def _resolve_wx_phone(code: str) -> str:
 
 @router.post("/wx-login", response_model=WxLoginResponse)
 def wx_login(req: WxLoginRequest):
+    # 配了 AppID/Secret 就走真实 code2session；没配时用 .env 的 MP_MOCK_PHONE 兜底，
+    # 方便开发者工具（测试号跑不通 code2session）与真机调试。
+    # 线上（APP_ENV=production）绝不走 mock：否则任何人 POST 一个 code=mock 就能拿到
+    # MP_MOCK_PHONE 那名员工的 token，等于把登录整个绕过。
     if settings.wx_appid and settings.wx_app_secret:
         phone = _resolve_wx_phone(req.code)
-    elif settings.mp_mock_phone:
+    elif settings.mp_mock_phone and settings.app_env != "production":
         phone = settings.mp_mock_phone
+    elif settings.app_env == "production":
+        raise HTTPException(503, "线上未配置 WX_APPID/WX_APP_SECRET，微信登录不可用")
     else:
         raise HTTPException(503, "未配置 WX_APPID/WX_APP_SECRET，也未配置 MP_MOCK_PHONE")
 
