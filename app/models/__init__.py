@@ -19,6 +19,7 @@ from app.models.quote import Quote, QuoteItem
 from app.models.shipment import Shipment, ShipmentItem
 from app.models.cost import CostRecord
 from app.models.bank import BankStatement, BankTransaction
+from app.models.permission import PositionModulePermission
 
 __all__ = [
     "Order", "OrderStep", "OrderMaterial", "QualityResult",
@@ -30,4 +31,5 @@ __all__ = [
     "Shipment", "ShipmentItem",
     "CostRecord",
     "BankStatement", "BankTransaction",
+    "PositionModulePermission",
 ]

@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
-from app.models.contract import ContractItem, blocked_orders
+from app.models.contract import Contract, ContractItem, blocked_orders
 from app.models.order import (
     ORDER_STATUS_LABELS,
     PROGRAM_STEP,
@@ -51,21 +51,26 @@ def _build_steps(order_id: str) -> list[OrderStep]:
     ]
 
 
-def _contract_id_map(db: Session, order_ids: list[str]) -> dict[str, str]:
-    """订单 → 所属合同。工单是通过合同导入产生的才有值。"""
+def _contract_map(db: Session, order_ids: list[str]) -> dict[str, tuple[str, str]]:
+    """订单 → (所属合同 id, 合同状态)。工单是通过合同导入产生的才有值。
+
+    带上状态是给前端置灰用的：合同处于暂停/取消/结案时，它的待确认工单不能再接单。
+    """
     if not order_ids:
         return {}
     rows = (
-        db.query(ContractItem.order_id, ContractItem.contract_id)
+        db.query(ContractItem.order_id, ContractItem.contract_id, Contract.status)
+        .join(Contract, Contract.id == ContractItem.contract_id)
         .filter(ContractItem.order_id.in_(order_ids))
         .all()
     )
-    return {order_id: contract_id for order_id, contract_id in rows}
+    return {order_id: (contract_id, status) for order_id, contract_id, status in rows}
 
 
 def _to_response(
     order: Order,
     contract_id: str = "",
+    contract_status: str = "",
     quality_results: list | None = None,
     in_production_ids: set[str] | None = None,
 ) -> dict:
@@ -86,6 +91,7 @@ def _to_response(
         "current_step": order.current_step,
         "status": resolve_order_status(order, in_production_ids),
         "contract_id": contract_id,
+        "contract_status": contract_status,
         "create_date": order.create_date,
         "deadline": order.deadline,
         "steps": [
@@ -141,9 +147,11 @@ def _quality_results_map(db: Session, order_ids: list[str]) -> dict[str, list[di
 
 
 def _respond(db: Session, order: Order) -> dict:
+    contract_id, contract_status = _contract_map(db, [order.id]).get(order.id, ("", ""))
     return _to_response(
         order,
-        _contract_id_map(db, [order.id]).get(order.id, ""),
+        contract_id,
+        contract_status,
         _quality_results_map(db, [order.id]).get(order.id, []),
         in_production_order_ids(db, [order.id]),
     )
@@ -173,13 +181,17 @@ def list_orders(
         q = q.filter(Order.priority == priority)
     orders = q.order_by(Order.create_date.desc()).all()
     ids = [o.id for o in orders]
-    contracts = _contract_id_map(db, ids)
+    contracts = _contract_map(db, ids)
     qualities = _quality_results_map(db, ids)
     producing = in_production_order_ids(db, ids)
-    return [
-        _to_response(o, contracts.get(o.id, ""), qualities.get(o.id, []), producing)
-        for o in orders
-    ]
+
+    result = []
+    for o in orders:
+        contract_id, contract_status = contracts.get(o.id, ("", ""))
+        result.append(
+            _to_response(o, contract_id, contract_status, qualities.get(o.id, []), producing)
+        )
+    return result
 
 
 @router.get("/{order_id}", response_model=OrderResponse)
@@ -383,6 +395,11 @@ def advance_step(order_id: str, db: Session = Depends(get_db)):
 
 @router.post("/{order_id}/confirm", response_model=OrderResponse)
 def confirm_order(order_id: str, db: Session = Depends(get_db)):
+    """单张接单。
+
+    所属合同处于暂停/取消/结案时一律拦下（409）—— 与批量接单同口径，
+    否则界面上置灰了按钮，直接调接口还是能接单。
+    """
     order = (
         db.query(Order)
         .options(joinedload(Order.steps), joinedload(Order.materials))
@@ -391,6 +408,11 @@ def confirm_order(order_id: str, db: Session = Depends(get_db)):
     )
     if not order:
         raise HTTPException(404, "工单不存在")
+
+    blocked = blocked_orders(db, [order_id])
+    if order_id in blocked:
+        raise HTTPException(409, f"所属合同状态为「{blocked[order_id]}」，不能接单")
+
     if order.current_step != 0:
         status = resolve_order_status(order, in_production_order_ids(db, [order.id]))
         raise HTTPException(400, f"该工单已确认接单，当前状态：{status}")

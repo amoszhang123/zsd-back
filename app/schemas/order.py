@@ -45,6 +45,8 @@ class OrderResponse(BaseModel):
     current_step: int = 0
     status: str = ""
     contract_id: str = ""
+    # 所属合同的状态（正常/暂停/取消/结案）。非「正常」时该工单不能接单，前端据此置灰。
+    contract_status: str = ""
     create_date: date | None = None
     deadline: date | None = None
     steps: list[StepSchema] = []

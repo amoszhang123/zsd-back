@@ -71,8 +71,10 @@ class ContractSummary(BaseModel):
     id: str
     purchase_no: str = ""
     status: str = "正常"
-    # 非数据库字段：任一关联工单进过开工单即为 True，决定能否取消
+    # 非数据库字段：任一关联工单已到投产（加工）或之后环节即为 True，决定能否取消
     in_production: bool = False
+    # 非数据库字段：已接单但还没到终态（出货）的工单数，>0 时不能结案
+    unfinished_accepted: int = 0
     party_a: str = ""
     address: str = ""
     bank_name: str = ""

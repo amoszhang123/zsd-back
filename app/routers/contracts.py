@@ -9,10 +9,12 @@ from app.database import get_db
 from app.models.contract import (
     ALLOWED_STATUS_TRANSITIONS,
     CONTRACT_STATUS_CANCELLED,
+    CONTRACT_STATUS_CLOSED,
     Contract,
     ContractItem,
     contract_in_production,
     in_production_map,
+    unfinished_accepted_map,
 )
 from app.models.order import Order
 from app.models.production import WorkOrderItem
@@ -41,12 +43,15 @@ def _new_order_id(base: int, idx: int, taken: set[str]) -> str:
     raise HTTPException(500, "工单号已用尽，请稍后重试")
 
 
-def _to_summary(contract: Contract, in_production: bool = False) -> ContractSummary:
+def _to_summary(
+    contract: Contract, in_production: bool = False, unfinished_accepted: int = 0
+) -> ContractSummary:
     return ContractSummary(
         id=contract.id,
         purchase_no=contract.purchase_no,
         status=contract.status,
         in_production=in_production,
+        unfinished_accepted=unfinished_accepted,
         party_a=contract.party_a,
         address=contract.address,
         bank_name=contract.bank_name,
@@ -142,7 +147,11 @@ def _to_detail(
         )
 
     return ContractDetail(
-        **_to_summary(contract, contract_in_production(db, contract)).model_dump(),
+        **_to_summary(
+            contract,
+            contract_in_production(db, contract),
+            len(unfinished_accepted_map(db, [contract.id]).get(contract.id, [])),
+        ).model_dump(),
         deadline_synced=synced,
         delivery_unparsed=unparsed,
         items=items,
@@ -232,8 +241,12 @@ def list_contracts(db: Session = Depends(get_db)):
         .order_by(Contract.created_at.desc(), Contract.id.desc())
         .all()
     )
-    producing = in_production_map(db, [c.id for c in contracts])
-    return [_to_summary(c, c.id in producing) for c in contracts]
+    ids = [c.id for c in contracts]
+    producing = in_production_map(db, ids)
+    unfinished = unfinished_accepted_map(db, ids)
+    return [
+        _to_summary(c, c.id in producing, len(unfinished.get(c.id, []))) for c in contracts
+    ]
 
 
 @router.get("/{contract_id}", response_model=ContractDetail)
@@ -302,8 +315,9 @@ def update_contract_status(
     """变更合同状态。
 
     流转规则：正常 ⇄ 暂停 可来回；取消、结案是终态不可逆。
-    已投产（任一工单进过开工单）的合同不能取消，只能暂停后等结款再结案 ——
+    已投产（任一工单已到投产/加工或之后环节）的合同不能取消，只能暂停后等结款再结案 ——
     东西已经在做了，取消对不上实物。
+    结案还要求所有已接单的工单都走到终态（出货），否则结案后那些工单再也推不动。
     """
     contract = (
         db.query(Contract)
@@ -326,8 +340,21 @@ def update_contract_status(
 
     if target == CONTRACT_STATUS_CANCELLED and contract_in_production(db, contract):
         raise HTTPException(
-            409, f"合同 {contract_id} 已投产（有工单进过开工单），不能取消，只能暂停后结案"
+            409,
+            f"合同 {contract_id} 已投产（有工单进入投产/加工或之后环节），不能取消，只能暂停后结案",
         )
+
+    if target == CONTRACT_STATUS_CLOSED:
+        unfinished = unfinished_accepted_map(db, [contract.id]).get(contract.id, [])
+        if unfinished:
+            preview = "、".join(f"{o['id']}（{o['status']}）" for o in unfinished[:5])
+            if len(unfinished) > 5:
+                preview += f" 等共 {len(unfinished)} 张"
+            raise HTTPException(
+                409,
+                f"合同 {contract_id} 还有已接单但未完结的工单，不能结案：{preview}。"
+                f"等它们全部走到出货后再结案",
+            )
 
     contract.status = target
     db.commit()

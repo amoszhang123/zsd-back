@@ -4,8 +4,8 @@ from sqlalchemy import Date, DateTime, Double, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.database import Base
-from app.models.order import Order
-from app.models.production import WorkOrderItem
+from app.models.order import PRODUCTION_STEP, SHIPPING_STEP, Order, resolve_order_status
+from app.models.production import in_production_order_ids
 
 CONTRACT_STATUS_NORMAL = "正常"
 CONTRACT_STATUS_PAUSED = "暂停"
@@ -97,16 +97,18 @@ class ContractItem(Base):
 def in_production_map(db: Session, contract_ids: list[str]) -> set[str]:
     """返回其中「已投产」的合同 id 集合。
 
-    已投产 = 合同下任一关联工单进过开工单（work_order_items 里有记录）。
-    与「合同明细数量锁定」同口径：真正动过生产的才算，只流转到投产阶段但
-    从没开过工的不算。
+    已投产 = 合同下任一关联工单已流转到投产（加工）或之后的环节。
+    这类合同不能取消，只能暂停后等结款再结案。
     """
     if not contract_ids:
         return set()
     rows = (
         db.query(ContractItem.contract_id)
-        .join(WorkOrderItem, WorkOrderItem.order_id == ContractItem.order_id)
-        .filter(ContractItem.contract_id.in_(contract_ids))
+        .join(Order, Order.id == ContractItem.order_id)
+        .filter(
+            ContractItem.contract_id.in_(contract_ids),
+            Order.current_step >= PRODUCTION_STEP,
+        )
         .distinct()
         .all()
     )
@@ -115,6 +117,36 @@ def in_production_map(db: Session, contract_ids: list[str]) -> set[str]:
 
 def contract_in_production(db: Session, contract: "Contract") -> bool:
     return contract.id in in_production_map(db, [contract.id])
+
+
+def unfinished_accepted_map(db: Session, contract_ids: list[str]) -> dict[str, list[dict]]:
+    """contract_id → 已接单但还没到终态的工单 [{"id": 工单号, "status": 显示状态}]。
+
+    已接单 = current_step > 0（step 0 是待确认）；终态 = 已流转到出货阶段
+    （出货是流水线最后一步，与工作台完成率的口径一致）。
+
+    结案要求这份清单为空：还有活在做的合同结案掉，那些工单就再也推不动了。
+    未接单的工单不列入 —— 它们不阻塞结案，而结案后本来也接不了单。
+    """
+    if not contract_ids:
+        return {}
+    rows = (
+        db.query(ContractItem.contract_id, Order)
+        .join(Order, Order.id == ContractItem.order_id)
+        .filter(
+            ContractItem.contract_id.in_(contract_ids),
+            Order.current_step > 0,
+            Order.current_step < SHIPPING_STEP,
+        )
+        .all()
+    )
+    producing = in_production_order_ids(db, [order.id for _, order in rows])
+    result: dict[str, list[dict]] = {}
+    for contract_id, order in rows:
+        result.setdefault(contract_id, []).append(
+            {"id": order.id, "status": resolve_order_status(order, producing)}
+        )
+    return result
 
 
 def blocked_orders(db: Session, order_ids: list[str]) -> dict[str, str]:

@@ -2,7 +2,7 @@
 
 ⚠️ 不可逆：TRUNCATE 是 DDL，会隐式提交，无法回滚。执行前请自行确认已不需要这些数据。
 
-保留：employees（员工）、machines（机台基础数据）
+保留：employees（员工）、machines（机台基础数据）、position_module_permissions（权限配置）
 清空：其余所有表
 
 用法： cd factory && PYTHONPATH=. .venv/bin/python reset_data.py --yes
@@ -14,7 +14,8 @@ from sqlalchemy import inspect, text
 
 from app.database import engine
 
-KEEP = ("employees", "machines")
+# 权限配置属于系统设置而非业务数据，清库不该把管理员配好的模块可见性一起抹掉
+KEEP = ("employees", "machines", "position_module_permissions")
 
 
 def main() -> None:
@@ -28,8 +29,10 @@ def main() -> None:
     with engine.connect() as c:
         print(f"数据库共 {len(tables)} 张表\n")
         print("保留:")
+        before = {}
         for t in keep:
             n = c.execute(text(f"SELECT COUNT(*) FROM `{t}`")).scalar()
+            before[t] = n
             print(f"  ✅ {t:26} {n:>6} 行")
         print("\n清空:")
         total = 0
@@ -63,7 +66,8 @@ def main() -> None:
                 "SELECT AUTO_INCREMENT FROM information_schema.TABLES "
                 "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t"), {"t": t}).scalar()
             expect_kept = t in KEEP
-            ok = n > 0 if expect_kept else n == 0
+            # 保留表只要求行数没变（权限配置可能是空的，不能用「非空」当判据）
+            ok = n == before.get(t, 0) if expect_kept else n == 0
             if not ok:
                 bad.append(t)
             mark = "✅ 保留" if expect_kept else "✅ 已清空"
@@ -72,7 +76,7 @@ def main() -> None:
         if bad:
             print(f"❌ 结果不符合预期: {bad}")
             sys.exit(1)
-        print("🎉 清空完成：仅剩 employees 与 machines，其余表为空且自增 ID 已重置为 1")
+        print(f"🎉 清空完成：仅剩 {'、'.join(KEEP)}，其余表为空且自增 ID 已重置为 1")
 
 
 if __name__ == "__main__":

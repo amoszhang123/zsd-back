@@ -1,6 +1,4 @@
-import base64
 import hashlib
-import io
 import json
 import secrets
 import time
@@ -10,7 +8,6 @@ import urllib.request
 from datetime import date, datetime, timedelta
 from typing import Literal
 
-import qrcode
 from fastapi import APIRouter, Depends, File, HTTPException, Header, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func
@@ -52,8 +49,15 @@ from app.models.quality import (
     ScrapOrder,
 )
 from app.program_sheet import ProgramSheetError, parse_program_sheet
+from app.qr_image import render_qr_data_uri
 from app.quote_excel import XLSX_MIME, QuoteExportError, build_quote_xlsx, quote_filename
-from app.routers.auth import _get_token, _set_token
+from app.routers.auth import (
+    _get_token,
+    _set_token,
+    cancel_qr_login,
+    confirm_qr_login,
+    scan_qr_login,
+)
 from app.routers.contracts import (
     get_contract,
     import_contract,
@@ -197,7 +201,9 @@ def _get_access_token() -> str:
     token = data.get("access_token")
     if not token:
         raise HTTPException(
-            502, f"获取微信 access_token 失败: {data.get('errmsg')} (errcode={data.get('errcode')})"
+            502,
+            f"获取微信 access_token 失败: {data.get('errmsg')} (errcode={data.get('errcode')})，"
+            f"appid={settings.wx_appid or '(未配置)'}",
         )
     _access_token_cache["token"] = token
     _access_token_cache["expires_at"] = time.time() + int(data.get("expires_in", 7200))
@@ -207,8 +213,13 @@ def _get_access_token() -> str:
 def _resolve_wx_phone(code: str) -> str:
     data = _wx_request(f"{WX_PHONE_URL}?access_token={_get_access_token()}", {"code": code})
     if data.get("errcode"):
+        # errcode=40013（invalid appid）在这里几乎总是「后端配的 appid 跟小程序不是同一个」：
+        # access_token 能拿到说明后端 appid 本身有效，但 code 是另一个小程序签发的。
+        # 把后端在用的 appid 一并回给前端，不用登服务器就能判断是哪边配错了。
         raise HTTPException(
-            400, f"微信手机号解析失败: {data.get('errmsg')} (errcode={data['errcode']})"
+            400,
+            f"微信手机号解析失败: {data.get('errmsg')} (errcode={data['errcode']})，"
+            f"后端使用的 appid={settings.wx_appid or '(未配置)'}",
         )
 
     phone = (data.get("phone_info") or {}).get("purePhoneNumber") or ""
@@ -307,18 +318,6 @@ def get_employee_info(user=Depends(_get_mp_user), db: Session = Depends(get_db))
     }
 
 
-def _render_qr_data_uri(text: str) -> str:
-    img = qrcode.make(
-        text,
-        error_correction=qrcode.constants.ERROR_CORRECT_Q,
-        box_size=8,
-        border=2,
-    )
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-
-
 @router.get("/employee-qr", response_model=EmployeeQrResponse)
 def get_employee_qr(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
     """签发一张 60 秒时效的员工二维码。
@@ -335,7 +334,7 @@ def get_employee_qr(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
     return EmployeeQrResponse(
         employee_id=emp.id,
         name=emp.name,
-        qr_image=_render_qr_data_uri(token),
+        qr_image=render_qr_data_uri(token),
         token=token,
         expires_in=QR_TOKEN_TTL,
     )
@@ -364,6 +363,51 @@ def verify_qr(req: VerifyQrRequest, db: Session = Depends(get_db)):
                 return VerifyQrResponse(valid=True, employee_id=emp.id, name=emp.name)
 
     return VerifyQrResponse(valid=False)
+
+
+class MpQrLoginRequest(BaseModel):
+    # web 登录二维码里的 challenge，小程序扫码后从 JSON 里取出来
+    challenge: str = Field(min_length=16, max_length=64)
+
+
+class MpQrLoginScanOut(BaseModel):
+    """扫码结果：告诉手机上即将登录哪个网页账号，用于确认弹框。"""
+
+    account_name: str
+    username: str = ""
+    position: str = ""
+    employee_name: str = ""
+
+
+@router.post("/qr-login/scan", response_model=MpQrLoginScanOut)
+def mp_qr_login_scan(
+    req: MpQrLoginRequest, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    """快捷扫码扫到 web 登录码：按扫码人的工种匹配网页账号，标记为待确认。
+
+    工种没有对应网页账号时返回 403，文案由 auth.scan_qr_login 给。
+    """
+    emp = _current_employee(user, db)
+    return MpQrLoginScanOut(**scan_qr_login(req.challenge, emp.phone, emp.name, emp.position))
+
+
+@router.post("/qr-login/confirm")
+def mp_qr_login_confirm(
+    req: MpQrLoginRequest, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    """手机上点「确认登录」：签发 web 会话，web 端下一次轮询即登录成功。"""
+    emp = _current_employee(user, db)
+    return {"ok": True, "account_name": confirm_qr_login(req.challenge, emp.phone)}
+
+
+@router.post("/qr-login/cancel")
+def mp_qr_login_cancel(
+    req: MpQrLoginRequest, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    """手机上点「取消」：web 端立刻显示已取消并换新码，不用干等二维码过期。"""
+    emp = _current_employee(user, db)
+    cancel_qr_login(req.challenge, emp.phone)
+    return {"ok": True}
 
 
 class DispositionLossItem(BaseModel):
@@ -575,6 +619,7 @@ class MpQuickScanOut(BaseModel):
     # work_order_added 操作工已把订单加进开工单（现有的或新建的）
     # program          编程，可跳「订单程序时间」页
     # qc               质检，可跳「质检判定」页
+    # order_detail     管理员，只读跳「订单详情」页
     # reject           不满足加单/跳转条件，message 为提醒文案
     action: str
     work_order_id: int | None = None
@@ -664,6 +709,18 @@ def _work_order_add_error(db: Session, work_order: WorkOrder, order: Order) -> s
     return _order_add_error(db, order)
 
 
+def _require_operator(emp: Employee) -> None:
+    """开工单是操作工的活。前端只藏了入口，接口层必须自己拦 ——
+    否则管理员/编程/质检拿到 token 就能替车间开工、完工、改产量。
+    只读查看（列表 / 详情）不受此限制。
+    """
+    if emp.position != POSITION_OPERATOR:
+        raise HTTPException(
+            403,
+            f"只有「{POSITION_OPERATOR}」岗位可以操作开工单，你当前岗位是「{emp.position}」",
+        )
+
+
 def _participants_map(db: Session, order_ids: list[str]) -> dict[str, list[MpParticipantOut]]:
     """订单 → 做过的员工。一次查完，避免逐单 N+1。"""
     if not order_ids:
@@ -684,7 +741,11 @@ def _participants_map(db: Session, order_ids: list[str]) -> dict[str, list[MpPar
     return out
 
 
-def _work_order_detail(db: Session, work_order: WorkOrder) -> MpWorkOrderDetailOut:
+def _work_order_detail(
+    db: Session, work_order: WorkOrder, readonly: bool = False
+) -> MpWorkOrderDetailOut:
+    # readonly=True（管理员只读查看）时把 can_scan / can_complete 都关掉，
+    # 前端按钮由这两个字段驱动，自然就不显示了，不必在前端再判一次岗位
     items = list(work_order.items)
     order_ids = [i.order_id for i in items]
 
@@ -729,15 +790,15 @@ def _work_order_detail(db: Session, work_order: WorkOrder) -> MpWorkOrderDetailO
             )
         )
 
-    unfinished = work_order.status != WORK_ORDER_STATUS_DONE
+    actionable = work_order.status != WORK_ORDER_STATUS_DONE and not readonly
     return MpWorkOrderDetailOut(
         id=work_order.id,
         work_date=work_order.work_date,
         status=work_order.status,
         created_at=work_order.created_at,
         completed_at=work_order.completed_at,
-        can_scan=unfinished,
-        can_complete=unfinished,
+        can_scan=actionable,
+        can_complete=actionable,
         items=out_items,
     )
 
@@ -798,32 +859,50 @@ def _resolve_scanned_order(db: Session, candidates: list[str]) -> Order:
     raise HTTPException(404, f"二维码里的编号「{candidates[0]}」找不到对应订单")
 
 
+def _work_order_rows(work_orders: list[WorkOrder]) -> list[MpWorkOrderOut]:
+    return [
+        MpWorkOrderOut(
+            id=w.id,
+            work_date=w.work_date,
+            status=w.status,
+            created_at=w.created_at,
+            completed_at=w.completed_at,
+            item_count=len(w.items),
+        )
+        for w in work_orders
+    ]
+
+
 @router.get("/work-orders", response_model=MpWorkOrderListOut)
 def list_my_work_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
-    """我名下的开工单，按开工时间倒序。"""
+    """我名下的开工单，按开工时间倒序。
+
+    管理员是只读查看：返回全厂开工单，can_start 恒为 False ——
+    前端「新建开工单」按钮由这个字段驱动，所以不会显示出来。
+    """
     emp = _current_employee(user, db)
+    # items 要用来算 item_count，不 joinedload 就会逐张单懒加载一次
+    query = db.query(WorkOrder).options(joinedload(WorkOrder.items))
+
+    if emp.position == POSITION_ADMIN:
+        work_orders = query.order_by(
+            WorkOrder.created_at.desc(), WorkOrder.id.desc()
+        ).all()
+        return MpWorkOrderListOut(
+            work_orders=_work_order_rows(work_orders),
+            can_start=False,
+            open_work_order_id=None,
+        )
+
     work_orders = (
-        db.query(WorkOrder)
-        # items 要用来算 item_count，不 joinedload 就会逐张单懒加载一次
-        .options(joinedload(WorkOrder.items))
-        .join(WorkOrderEmployee, WorkOrderEmployee.work_order_id == WorkOrder.id)
+        query.join(WorkOrderEmployee, WorkOrderEmployee.work_order_id == WorkOrder.id)
         .filter(WorkOrderEmployee.employee_id == emp.id)
         .order_by(WorkOrder.created_at.desc(), WorkOrder.id.desc())
         .all()
     )
     open_wo = next((w for w in work_orders if w.status != WORK_ORDER_STATUS_DONE), None)
     return MpWorkOrderListOut(
-        work_orders=[
-            MpWorkOrderOut(
-                id=w.id,
-                work_date=w.work_date,
-                status=w.status,
-                created_at=w.created_at,
-                completed_at=w.completed_at,
-                item_count=len(w.items),
-            )
-            for w in work_orders
-        ],
+        work_orders=_work_order_rows(work_orders),
         can_start=open_wo is None,
         open_work_order_id=open_wo.id if open_wo else None,
     )
@@ -838,6 +917,7 @@ def create_my_work_order(user=Depends(_get_mp_user), db: Session = Depends(get_d
     挪到扫码添加那一步做。「名下不能有未完工的单」这条两端一致。
     """
     emp = _current_employee(user, db)
+    _require_operator(emp)
     open_wo = _open_work_order(db, emp.id)
     if open_wo:
         raise HTTPException(
@@ -853,6 +933,12 @@ def get_my_work_order(
     work_order_id: int, user=Depends(_get_mp_user), db: Session = Depends(get_db)
 ):
     emp = _current_employee(user, db)
+    if emp.position == POSITION_ADMIN:
+        # 管理员只读查看任意开工单（不在其名下也算），动作开关由 readonly 关掉
+        work_order = db.query(WorkOrder).filter(WorkOrder.id == work_order_id).first()
+        if not work_order:
+            raise HTTPException(404, f"开工单不存在: #{work_order_id}")
+        return _work_order_detail(db, work_order, readonly=True)
     return _work_order_detail(db, _owned_work_order(db, work_order_id, emp.id))
 
 
@@ -865,6 +951,7 @@ def scan_add_order(
 ):
     """扫图纸二维码，把解析出的订单加进本张开工单。"""
     emp = _current_employee(user, db)
+    _require_operator(emp)
     work_order = _owned_work_order(db, work_order_id, emp.id)
 
     candidates = _parse_scan_candidates(req.content)
@@ -891,10 +978,13 @@ def quick_scan(req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Dep
              /work-orders/{id}/scan 完全一致（同一份 _work_order_add_error）。
     编程   → 订单已到程序阶段才返回 program，否则 reject 让前端弹窗提醒。
     质检   → 订单已有待检阶段才返回 qc，否则 reject。
+    管理员 → 只读查看，返回 order_detail，前端跳订单详情；不参与生产。
     程序/质检的放行口径与各目标页面自身一致，避免「跳过去才发现做不了」。
     """
     emp = _current_employee(user, db)
-    if emp.position not in (POSITION_OPERATOR, POSITION_PROGRAMMER, POSITION_QC):
+    if emp.position not in (
+        POSITION_OPERATOR, POSITION_PROGRAMMER, POSITION_QC, POSITION_ADMIN
+    ):
         raise HTTPException(403, f"「{emp.position}」岗位不支持快捷扫码")
 
     candidates = _parse_scan_candidates(req.content)
@@ -910,6 +1000,12 @@ def quick_scan(req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Dep
         current_step=order.current_step,
         action="reject",
     )
+
+    if emp.position == POSITION_ADMIN:
+        # 管理员不参与生产，扫码只为查看。订单详情对管理员已放开全量可见，
+        # 所以这里不需要任何阶段判断，扫到什么就看什么
+        out.action = "order_detail"
+        return out
 
     if emp.position == POSITION_OPERATOR:
         # 与开工单无关的校验先做：不通过就别新建开工单，免得留下一张空单
@@ -957,6 +1053,7 @@ def complete_my_work_order(
     接力参与度那套逻辑不重写第二遍。
     """
     emp = _current_employee(user, db)
+    _require_operator(emp)
     work_order = _owned_work_order(db, work_order_id, emp.id)
     if work_order.status == WORK_ORDER_STATUS_DONE:
         raise HTTPException(400, "该开工单已完工，不能重复提交")
@@ -1262,12 +1359,16 @@ def _programmers_map(db: Session, order_ids: list[str]) -> dict[str, list[str]]:
 def _my_order_ids(
     db: Session, emp: Employee, qc_pending: dict[str, tuple[str, int]] | None = None
 ) -> list[str]:
-    """「我的订单」的取数口径，按岗位分三种。
+    """「我的订单」的取数口径，按岗位分四种。
 
+    管理员：全厂订单，与「接单管理」同一数据范围。
     编程岗：所有待编程的订单（还没人接的活，谁都能领）+ 我参与编程过的订单。
     质检岗：所有待质检的订单 + 我质检过的订单。
     其它岗：我参与生产过的订单（order_contributions 里有我的记录）。
     """
+    if emp.position == POSITION_ADMIN:
+        return [row[0] for row in db.query(Order.id).all()]
+
     if emp.position == POSITION_PROGRAMMER:
         pending = [
             row[0]
@@ -1305,7 +1406,8 @@ def _visible_order(db: Session, order_id: str, emp: Employee) -> Order:
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(404, f"订单不存在: {order_id}")
-    if order_id not in _my_order_ids(db, emp):
+    # 管理员的可见范围就是全厂，不必再把全量 id 拉出来做成员判断
+    if emp.position != POSITION_ADMIN and order_id not in _my_order_ids(db, emp):
         raise HTTPException(403, f"订单 {order_id} 不在你的「我的订单」范围内")
     return order
 
@@ -1404,8 +1506,8 @@ def _order_detail(db: Session, order: Order, emp: Employee) -> MpOrderDetailOut:
 def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
     """我涉及的订单，按岗位分口径：
 
-    编程岗 = 所有待编程 + 我编程过的；质检岗 = 所有待质检 + 我质检过的；
-    其它岗 = 我参与生产过的。
+    管理员 = 全厂订单（与「接单管理」同范围）；编程岗 = 所有待编程 + 我编程过的；
+    质检岗 = 所有待质检 + 我质检过的；其它岗 = 我参与生产过的。
     """
     emp = _current_employee(user, db)
     is_programmer = emp.position == POSITION_PROGRAMMER
