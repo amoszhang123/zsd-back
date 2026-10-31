@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.database import Base
@@ -40,10 +40,20 @@ class Employee(Base):
 
 
 class Machine(Base):
+    """加工机台。
+
+    id 由系统生成（MC0001 递增），不再由人填 —— 机台上贴的静态二维码里装的就是
+    这一串，改号就等于换码，所以编号只读。停用的机台扫不进、web 也选不到，
+    但不做硬删除：历史开工单的订单行还指着它。
+    """
+
     __tablename__ = "machines"
 
     id: Mapped[str] = mapped_column(String(20), primary_key=True)
     name: Mapped[str] = mapped_column(String(50), default="")
+    model: Mapped[str] = mapped_column(String(50), default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
 class WorkOrder(Base):
@@ -58,14 +68,10 @@ class WorkOrder(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     work_date: Mapped[date] = mapped_column(Date, index=True)
-    machine_id: Mapped[str | None] = mapped_column(
-        String(20), ForeignKey("machines.id"), nullable=True
-    )
     status: Mapped[str] = mapped_column(String(10), default="开工", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    machine: Mapped["Machine | None"] = relationship()
     employees: Mapped[list["WorkOrderEmployee"]] = relationship(
         back_populates="work_order", cascade="all, delete-orphan"
     )
@@ -105,10 +111,16 @@ class WorkOrderItem(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     work_order_id: Mapped[int] = mapped_column(Integer, ForeignKey("work_orders.id"))
     order_id: Mapped[str] = mapped_column(String(20), ForeignKey("orders.id"), index=True)
+    # 加工机台挂在订单行，而不是开工单单头：一张单可能同时做几个订单，
+    # 人可能在 A 台做甲、B 台做乙。为空 = 走老链路（直接扫订单码开工）没关联机台。
+    machine_id: Mapped[str | None] = mapped_column(
+        String(20), ForeignKey("machines.id"), nullable=True, index=True
+    )
     completed_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     work_order: Mapped["WorkOrder"] = relationship(back_populates="items")
     order: Mapped["Order"] = relationship()
+    machine: Mapped["Machine | None"] = relationship()
 
 
 class OrderContribution(Base):

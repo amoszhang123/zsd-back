@@ -7,7 +7,7 @@ from app.config import settings
 from app.database import init_db
 from app.routers import (
     health, dashboard, orders, contracts, quotes, shipments, production,
-    employees, auth, mp, quality, costs, bank, permissions,
+    employees, auth, mp, quality, costs, materials, machines, bank, permissions,
 )
 
 
@@ -47,6 +47,8 @@ app.include_router(employees.router)
 app.include_router(auth.router)
 app.include_router(mp.router)
 app.include_router(costs.router)
+app.include_router(materials.router)
+app.include_router(machines.router)
 app.include_router(bank.router)
 app.include_router(permissions.router)
 

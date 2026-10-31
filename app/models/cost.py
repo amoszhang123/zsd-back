@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Double, Integer, String
+from sqlalchemy import Boolean, Date, DateTime, Double, Integer, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -27,6 +27,15 @@ class CostRecord(Base):
     invoiced: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     remark: Mapped[str] = mapped_column(String(500), default="")
     purchase_date: Mapped[date] = mapped_column(Date, index=True)
+
+    # —— 纳入物料库存（见 routers/materials.py 的 stock-in 接口）——
+    # 入库的唯一来源就是这里：一条成本记录最多只能纳入一次，撤销后这三列清空。
+    # stocked_qty 单独存而不是直接用 quantity：以后若允许「一条成本只纳一部分」，
+    # 库存数量与成本数量就会分叉，提前留一列免得那时改表。
+    material_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    stocked_qty: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    stocked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.now, onupdate=datetime.now

@@ -6,6 +6,9 @@ from pydantic import BaseModel, Field
 class StartWorkRequest(BaseModel):
     employee_ids: list[str] = Field(min_length=1)
     order_ids: list[str] = Field(min_length=1)
+    # order_id → machine_id。选填：web 端可以逐行选机台，也可以整张单不选。
+    # 老链路（小程序直接扫订单码开工）完全不传这个字段，机台留空。
+    machine_map: dict[str, str] = {}
 
 
 class WorkOrderEmployeeOut(BaseModel):
@@ -18,15 +21,20 @@ class WorkOrderItemOut(BaseModel):
     product: str = ""
     quantity: int = 0
     completed_qty: int | None = None
+    # 加工机台（订单行级）。为空 = 走老链路开工，没关联机台。
+    machine_id: str | None = None
+    machine_name: str = ""
 
 
 class WorkOrderResponse(BaseModel):
     id: int
     work_date: date
-    machine_id: str | None = None
     status: str = "开工"
     employees: list[WorkOrderEmployeeOut] = []
     items: list[WorkOrderItemOut] = []
+    # 本单涉及的机台（去重，按首次出现顺序），列表页一列展示用。
+    # 一单可跨机台，所以这里给的是集合，不是单个值。
+    machines: list[str] = []
     completed_qty_total: int = 0
     created_at: datetime
     completed_at: datetime | None = None

@@ -147,3 +147,44 @@ class DashboardAlert(BaseModel):
     order_id: str | None = None
     doc_type: str | None = None
     doc_id: int | None = None
+
+
+class EmployeePerfRow(BaseModel):
+    """员工效能看板的一行。
+
+    hours       投产工时 = Σ(订单预估工时 × 该员工参与度)，订单以「质检1首次合格」的月份归属
+    order_count 计入工时的订单数
+    output_qty  当月完工产出件数（该员工参与的已完工开工单明细合计）
+    defect_qty  当月记录的返工件数（返工 + 报废 + 维修，按异常单负责人归属）
+    good_rate   良品率 = (产出 − 不良) / 产出，无产出时为 None（前端显示「—」）
+    """
+
+    employee_id: str
+    employee_name: str = ""
+    position: str = ""
+    employee_type: str = ""
+    status: str = ""
+    hours: float = 0.0
+    order_count: int = 0
+    output_qty: int = 0
+    defect_qty: int = 0
+    rework_qty: int = 0
+    scrap_qty: int = 0
+    repair_qty: int = 0
+    good_rate: float | None = None
+    # 占本月全员投产工时的比例，前端画条形图用
+    hours_share: float = 0.0
+
+
+class EmployeePerfBoard(BaseModel):
+    month: str
+    rows: list[EmployeePerfRow] = []
+    total_hours: float = 0.0
+    total_output: int = 0
+    total_defect: int = 0
+    good_rate: float | None = None
+    employee_count: int = 0
+    order_count: int = 0
+    # 本月质检1合格、但预估工时没填（为 0）的订单数 —— 这些订单对工时贡献为 0，
+    # 要在看板上明说，否则用户会以为工时统计少算了。
+    missing_hours_orders: int = 0

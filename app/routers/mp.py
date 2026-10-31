@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import secrets
 import time
 import urllib.error
@@ -30,6 +31,7 @@ from app.models.production import (
     POSITION_QC,
     WORK_ORDER_STATUS_DONE,
     Employee,
+    Machine,
     OrderContribution,
     OrderProgrammer,
     WorkOrder,
@@ -585,6 +587,9 @@ class MpWorkOrderItemOut(BaseModel):
     quantity: int = 0
     # 本张开工单填的完工数，未完工时为 None
     completed_qty: int | None = None
+    # 加工机台（订单行级）。为空 = 走老链路开工没关联机台，界面上显示「未关联」。
+    machine_id: str | None = None
+    machine_name: str = ""
     # 其它开工单已累计完工的数量，用来算「本次再做多少就够全量」
     already_done: int = 0
     order_status: str = ""
@@ -624,6 +629,38 @@ class MpQuickScanOut(BaseModel):
     action: str
     work_order_id: int | None = None
     work_order_is_new: bool = False
+    message: str = ""
+
+
+class MpMachineScanOut(BaseModel):
+    """扫机台码的结果：机台信息 + 名下那张未完工开工单。
+
+    前端拿到后进「机台开工」页：上面显示机台，下面列 work_order 里已有的订单
+    （可以点选直接绑机台），或再扫订单码。work_order 为 None 表示名下还没有
+    未完工单 —— 此时扫到第一个有效订单才会建单，扫完机台就放弃不会留空单。
+    """
+
+    machine_id: str
+    machine_name: str = ""
+    machine_model: str = ""
+    work_order: MpWorkOrderDetailOut | None = None
+
+
+class MpMachineBindRequest(BaseModel):
+    machine_id: str = Field(min_length=1, max_length=20)
+    # 二选一：点选单里已有订单时直接给 order_id；现场扫订单码时传扫码原文 content，
+    # 由后端解析（与 scan_add_order / quick_scan 同一套解析规则，前端不重复实现）。
+    order_id: str | None = Field(default=None, max_length=20)
+    content: str | None = Field(default=None, max_length=500)
+
+
+class MpMachineBindOut(BaseModel):
+    work_order_id: int
+    work_order_is_new: bool = False
+    order_id: str
+    machine_id: str
+    # 覆盖前那一行的机台，前端用来提示「已从 MC0003 改为 MC0001」
+    replaced_machine_id: str | None = None
     message: str = ""
 
 
@@ -667,11 +704,19 @@ def _open_work_order(db: Session, employee_id: str) -> WorkOrder | None:
     )
 
 
-def _new_work_order(db: Session, emp: Employee) -> WorkOrder:
-    """建一张空开工单。订单随后扫码逐个加，建单时不校验订单。"""
+def _new_work_order(
+    db: Session, emp: Employee, order_id: str | None = None, machine_id: str | None = None
+) -> WorkOrder:
+    """建一张空开工单。订单随后扫码逐个加，建单时不校验订单。
+
+    order_id 给了就顺带带上第一行 —— 机台开工链路要求「扫到第一个有效订单才
+    建单」，建单和加第一行是同一个动作，分两步会留下一个可观测的空单窗口。
+    """
     today = date.today()
     work_order = WorkOrder(work_date=today)
     work_order.employees = [WorkOrderEmployee(employee_id=emp.id, work_date=today)]
+    if order_id:
+        work_order.items = [WorkOrderItem(order_id=order_id, machine_id=machine_id)]
     db.add(work_order)
     db.commit()
     db.refresh(work_order)
@@ -784,6 +829,8 @@ def _work_order_detail(
                 model=order.model if order else "",
                 quantity=order.quantity if order else 0,
                 completed_qty=item.completed_qty,
+                machine_id=item.machine_id,
+                machine_name=item.machine.name if item.machine else "",
                 already_done=already.get(item.order_id, 0),
                 order_status=resolve_order_status(order, producing) if order else "",
                 participants=participants.get(item.order_id, []),
@@ -1040,6 +1087,150 @@ def quick_scan(req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Dep
         return out
     out.action = "qc"
     return out
+
+
+# ---------------------------------------------------------------- 机台开工
+#
+# 链路：工作台「快捷扫码」扫到机台码 → 前端本地认出 type=machine → 进「机台开工」页
+# → 页面调 /machine-scan 拿机台 + 名下未完工单 → 点选已有订单或再扫订单码
+# → /machine-bind 落库。
+#
+# 机台不是开工的必需品：老链路（扫订单码）照旧能开工，machine_id 留空。
+
+def _parse_machine_code(content: str) -> str:
+    """从扫码内容里取出机台编号；不是机台码就返回空串。
+
+    标签上的内容是 {"type":"machine","machineId":"MC0001"}，type 字段是与订单码
+    （{"workOrderNo":...}）区分的唯一依据。也容忍直接扫到裸编号 MC0001 ——
+    现场有人会把码抄在纸上，或者用别的方式生成。
+    """
+    text = (content or "").strip()
+    if not text:
+        return ""
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return ""
+        if data.get("type") != "machine":
+            return ""
+        return str(data.get("machineId") or "").strip()
+    return text if re.fullmatch(r"MC\d{4,6}", text) else ""
+
+
+@router.post("/machine-scan", response_model=MpMachineScanOut)
+def machine_scan(
+    req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    """扫机台码：返回机台信息 + 本人名下未完工的开工单（含各订单已绑机台）。"""
+    emp = _current_employee(user, db)
+    _require_operator(emp)
+
+    code = _parse_machine_code(req.content)
+    if not code:
+        raise HTTPException(400, "这不是机台码，请扫机台上贴的二维码")
+
+    machine = db.query(Machine).filter(Machine.id == code).first()
+    if not machine:
+        raise HTTPException(404, f"机台 {code} 不存在，可能是旧标签")
+    if not machine.active:
+        raise HTTPException(400, f"机台 {machine.id} 已停用，不能开工")
+
+    open_wo = _open_work_order(db, emp.id)
+    return MpMachineScanOut(
+        machine_id=machine.id,
+        machine_name=machine.name,
+        machine_model=machine.model,
+        work_order=_work_order_detail(db, open_wo) if open_wo else None,
+    )
+
+
+@router.post("/machine-bind", response_model=MpMachineBindOut)
+def machine_bind(
+    req: MpMachineBindRequest, user=Depends(_get_mp_user), db: Session = Depends(get_db)
+):
+    """把机台绑到某个订单上。三条分支，全走同一套校验：
+
+    1. 订单已经在本人的未完工单里 → 只改机台（原机台不同则覆盖并在 message 里说明）
+    2. 订单不在单里 → 走 _work_order_add_error 校验后加一行，并带上机台
+    3. 名下还没有未完工单 → 订单校验通过后**连单带行一起建**，不留空单窗口
+    """
+    emp = _current_employee(user, db)
+    _require_operator(emp)
+
+    machine = db.query(Machine).filter(Machine.id == req.machine_id).first()
+    if not machine:
+        raise HTTPException(404, f"机台不存在: {req.machine_id}")
+    if not machine.active:
+        raise HTTPException(400, f"机台 {machine.id} 已停用，不能开工")
+
+    # 扫码原文就地解析成订单号，后面的分支只认 order_id
+    order_id = (req.order_id or "").strip()
+    if not order_id:
+        if _parse_machine_code(req.content or ""):
+            raise HTTPException(400, "这是机台码，请扫图纸上的订单二维码")
+        candidates = _parse_scan_candidates(req.content or "")
+        if not candidates:
+            raise HTTPException(400, "请提供订单号，或扫订单二维码")
+        order_id = _resolve_scanned_order(db, candidates).id
+
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(404, f"订单不存在: {order_id}")
+
+    open_wo = _open_work_order(db, emp.id)
+    if open_wo:
+        existing = next((i for i in open_wo.items if i.order_id == order.id), None)
+        if existing:
+            if existing.machine_id == machine.id:
+                return MpMachineBindOut(
+                    work_order_id=open_wo.id,
+                    order_id=order.id,
+                    machine_id=machine.id,
+                    message=f"订单 {order.id} 已经关联 {machine.id}，不用重复扫",
+                )
+            replaced = existing.machine_id
+            existing.machine_id = machine.id
+            db.commit()
+            return MpMachineBindOut(
+                work_order_id=open_wo.id,
+                order_id=order.id,
+                machine_id=machine.id,
+                replaced_machine_id=replaced,
+                message=(
+                    f"订单 {order.id} 的机台已改为 {machine.id}"
+                    + (f"（原为 {replaced}）" if replaced else "（原来未关联）")
+                ),
+            )
+
+        err = _work_order_add_error(db, open_wo, order)
+        if err:
+            raise HTTPException(400, err)
+        db.add(
+            WorkOrderItem(
+                work_order_id=open_wo.id, order_id=order.id, machine_id=machine.id
+            )
+        )
+        db.commit()
+        return MpMachineBindOut(
+            work_order_id=open_wo.id,
+            order_id=order.id,
+            machine_id=machine.id,
+            message=f"订单 {order.id} 已加入开工单 #{open_wo.id}，机台 {machine.id}",
+        )
+
+    # 没有未完工单：先把订单本身的开工条件校验完再建单，避免留下空单
+    err = _order_add_error(db, order)
+    if err:
+        raise HTTPException(400, err)
+    work_order = _new_work_order(db, emp, order_id=order.id, machine_id=machine.id)
+    return MpMachineBindOut(
+        work_order_id=work_order.id,
+        work_order_is_new=True,
+        order_id=order.id,
+        machine_id=machine.id,
+        message=f"已新建开工单 #{work_order.id}，订单 {order.id} 关联机台 {machine.id}",
+    )
 
 
 @router.post("/work-orders/{work_order_id}/complete", response_model=MpWorkOrderDetailOut)

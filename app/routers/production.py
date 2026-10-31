@@ -10,6 +10,7 @@ from app.models.order import ORDER_STATUS_LABELS, PRODUCTION_STEP, QUALITY1_STEP
 from app.models.production import (
     WORK_ORDER_STATUS_DONE,
     Employee,
+    Machine,
     OrderContribution,
     WorkOrder,
     WorkOrderEmployee,
@@ -31,10 +32,27 @@ router = APIRouter(prefix="/api/production", tags=["production"])
 
 
 def _to_work_order_response(work_order: WorkOrder) -> WorkOrderResponse:
+    items = [
+        WorkOrderItemOut(
+            order_id=item.order_id,
+            product=item.order.product if item.order else "",
+            quantity=item.order.quantity if item.order else 0,
+            completed_qty=item.completed_qty,
+            machine_id=item.machine_id,
+            machine_name=item.machine.name if item.machine else "",
+        )
+        for item in work_order.items
+    ]
+    # 一单可跨机台，列表页只展示集合；去重但保留首次出现顺序，
+    # 这样「第一台」就是人实际从哪台开始干的
+    machines: list[str] = []
+    for it in items:
+        if it.machine_id and it.machine_id not in machines:
+            machines.append(it.machine_id)
+
     return WorkOrderResponse(
         id=work_order.id,
         work_date=work_order.work_date,
-        machine_id=work_order.machine_id,
         status=work_order.status,
         employees=[
             WorkOrderEmployeeOut(
@@ -43,15 +61,8 @@ def _to_work_order_response(work_order: WorkOrder) -> WorkOrderResponse:
             )
             for link in work_order.employees
         ],
-        items=[
-            WorkOrderItemOut(
-                order_id=item.order_id,
-                product=item.order.product if item.order else "",
-                quantity=item.order.quantity if item.order else 0,
-                completed_qty=item.completed_qty,
-            )
-            for item in work_order.items
-        ],
+        items=items,
+        machines=machines,
         completed_qty_total=sum(item.completed_qty or 0 for item in work_order.items),
         created_at=work_order.created_at,
         completed_at=work_order.completed_at,
@@ -178,6 +189,25 @@ def start_work(req: StartWorkRequest, db: Session = Depends(get_db)):
     if not_ready:
         raise HTTPException(400, not_ready)
 
+    # 机台选填，但选了就必须是真机台且在用。不校验的话，前端一个拼错就会
+    # 在 order 行上留下一个指向不存在机台的 id（MySQL 会直接拒，报成 500）。
+    machine_map = {k: v for k, v in req.machine_map.items() if v}
+    unknown_orders = [oid for oid in machine_map if oid not in order_ids]
+    if unknown_orders:
+        raise HTTPException(400, f"机台指定给了不在本次开工范围内的订单: {', '.join(unknown_orders)}")
+    if machine_map:
+        machine_ids = list(dict.fromkeys(machine_map.values()))
+        found = {
+            m.id: m
+            for m in db.query(Machine).filter(Machine.id.in_(machine_ids)).all()
+        }
+        missing = [mid for mid in machine_ids if mid not in found]
+        if missing:
+            raise HTTPException(404, f"机台不存在: {', '.join(missing)}")
+        stopped = [mid for mid in machine_ids if not found[mid].active]
+        if stopped:
+            raise HTTPException(400, f"机台已停用，不能开工: {', '.join(stopped)}")
+
     # 合同状态非「正常」（暂停/取消/结案）的工单不能开工。
     # 完工不拦：活已经干完了，拦着只会让完工数量对不上实物。
     blocked = blocked_orders(db, order_ids)
@@ -211,7 +241,9 @@ def start_work(req: StartWorkRequest, db: Session = Depends(get_db)):
     work_order.employees = [
         WorkOrderEmployee(employee_id=eid, work_date=today) for eid in employee_ids
     ]
-    work_order.items = [WorkOrderItem(order_id=oid) for oid in order_ids]
+    work_order.items = [
+        WorkOrderItem(order_id=oid, machine_id=machine_map.get(oid)) for oid in order_ids
+    ]
     db.add(work_order)
 
     db.commit()

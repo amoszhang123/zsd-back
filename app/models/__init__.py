@@ -18,6 +18,14 @@ from app.models.contract import Contract, ContractItem
 from app.models.quote import Quote, QuoteItem
 from app.models.shipment import Shipment, ShipmentItem
 from app.models.cost import CostRecord
+from app.models.inventory import (
+    IssueItem,
+    IssueOrder,
+    Material,
+    MaterialMovement,
+    MaterialScrapItem,
+    MaterialScrapOrder,
+)
 from app.models.bank import BankStatement, BankTransaction
 from app.models.permission import PositionModulePermission
 
@@ -30,6 +38,8 @@ __all__ = [
     "Quote", "QuoteItem",
     "Shipment", "ShipmentItem",
     "CostRecord",
+    "Material", "MaterialMovement", "IssueOrder", "IssueItem",
+    "MaterialScrapOrder", "MaterialScrapItem",
     "BankStatement", "BankTransaction",
     "PositionModulePermission",
 ]

@@ -3,7 +3,7 @@ from datetime import date, timedelta
 
 from app.database import SessionLocal
 from app.models.order import Order, OrderStep, OrderMaterial, STEP_KEYS, STEP_LABELS
-from app.models.production import Employee, Machine
+from app.models.production import Employee
 
 CUSTOMERS = ["深圳华为技术", "东莞比亚迪", "苏州三星半导体", "上海中芯国际", "杭州海康威视", "北京小米科技", "广州格力电器", "成都京东方"]
 PRODUCTS = ["PCB主板A-301", "铝合金外壳B-205", "不锈钢法兰C-118", "铜基散热器D-407", "钛合金连接器E-092", "碳纤维面板F-330"]
@@ -18,7 +18,6 @@ EMPLOYEES = [
     ("100007", "孙丽", "女", "440301199107097890", "2023-06-15", "在职", "质检"),
     ("100008", "周磊", "男", "440301198603108901", "2017-11-20", "离职", "操作工"),
 ]
-MACHINES = ["MC-A01", "MC-A02", "MC-B01", "MC-B02", "MC-C01", "MC-C02"]
 
 
 def seed_if_empty():
@@ -30,8 +29,8 @@ def seed_if_empty():
         for eid, ename, egender, eid_card, ehire, estatus, eposition in EMPLOYEES:
             db.merge(Employee(id=eid, name=ename, gender=egender, id_card=eid_card,
                               hire_date=date.fromisoformat(ehire), status=estatus, position=eposition))
-        for mid in MACHINES:
-            db.merge(Machine(id=mid, name=mid))
+        # 机台不再种数据：编号由系统生成 MC0001，且机台必须带名称/型号才有意义，
+        # 预置一堆 MC-A01 只会让人以为那是真的机器。上线后到「机台管理」里建。
 
         for i in range(24):
             ts = 1726400000 + i

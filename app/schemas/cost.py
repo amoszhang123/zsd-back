@@ -69,5 +69,11 @@ class CostRecordOut(BaseModel):
     invoiced: bool = False
     remark: str = ""
     purchase_date: date
+    # 纳入库存后的回填：material_id 为空 = 还没入库
+    material_id: int | None = None
+    material_code: str = ""
+    material_name: str = ""
+    stocked_qty: float | None = None
+    stocked_at: datetime | None = None
     created_at: datetime
     updated_at: datetime

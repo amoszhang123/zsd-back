@@ -5,6 +5,10 @@ pydantic-settings>=2.0
 sqlalchemy>=2.0
 pymysql>=1.1
 cryptography>=42.0
+# 物料标签用 Code128 一维码（现场那批扫码枪是一维枪，且 50×30 的小标签上
+# 二维码至少要 15mm 见方才扫得稳，一维码 13mm 高就够）。
+# 只用它算 0/1 模块序列，出图自己按整数像素画，见 app/material_label.py
+python-barcode>=0.15
 qrcode[pil]>=7.4
 pillow>=10.0
 python-multipart>=0.0.9
