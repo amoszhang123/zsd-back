@@ -120,56 +120,85 @@ def init_db():
         import logging
         logging.warning("create_all 并发冲突，已忽略: %s", e)
 
-    ensure_tenant_columns()
+    ensure_schema()
 
 
-def ensure_tenant_columns() -> list[str]:
-    """给缺少 is_test 列的既有表补列，返回补齐的表名。
+def _column_ddl(table: str, col) -> str:
+    """把模型上的一列渲染成 MySQL 的 ADD COLUMN 语句。
+
+    nullable=False 且没有 server_default 的列，在已有数据的表上是加不进去的
+    （MySQL 严格模式会报 "Invalid default value"），所以按类型补一个兜底默认值。
+    Python 侧的 default（如 default=datetime.now）不会出现在 DDL 里，这里没有忽略它，
+    只是它只对之后的写入生效，存量行仍需这个兜底值。
+    """
+    from sqlalchemy.schema import CreateColumn
+
+    ddl = str(CreateColumn(col).compile(dialect=engine.dialect))
+    if not col.nullable and col.server_default is None:
+        lit = _TYPE_DEFAULT.get(type(col.type).__name__.upper())
+        if lit is None:
+            # 复合类型（枚举、JSON 等）拿不准，就地放宽为可空，宁可少约束也别卡住启动
+            ddl = ddl.replace(" NOT NULL", "")
+        else:
+            ddl += f" DEFAULT {lit}"
+    return f"ALTER TABLE `{table}` ADD COLUMN {ddl}"
+
+
+_TYPE_DEFAULT = {
+    "STRING": "''", "VARCHAR": "''", "TEXT": "''", "CHAR": "''",
+    "INTEGER": "0", "BIGINT": "0", "SMALLINT": "0", "TINYINT": "0",
+    "BOOLEAN": "0",
+    "NUMERIC": "0", "DECIMAL": "0", "FLOAT": "0", "REAL": "0", "DOUBLE": "0",
+    "DATETIME": "CURRENT_TIMESTAMP", "DATE": "'1970-01-01'", "TIME": "'00:00:00'",
+}
+
+
+def ensure_schema(apply: bool = True) -> dict[str, list[str]]:
+    """把数据库结构对齐到模型定义：只加表、只加列，绝不删列或改类型。
 
     create_all 只建「缺失的表」，从不 ALTER「已存在的表」；而 deploy.sh 只有
-    git pull + 重建镜像，没有迁移步骤。于是「代码上线了、库没改」会让所有带数据域
-    过滤的查询直接 500（Unknown column 'orders.is_test'）—— 生产上踩过一次：
-    /api/orders、/api/employees 全挂，只有登录这类不查库的接口是好的。
+    git pull + 重建镜像，没有迁移步骤。生产上因此连着踩了两次：缺 is_test 列让
+    所有业务查询 500，缺 machines.model 让机台种子直接写不进去。
 
-    这里在启动时幂等地补一遍：只 ADD 缺的列，已经有的跳过；多 worker 同时启动
-    撞到 Duplicate column 也当成功。DDL 失败只记日志，不阻断启动。
+    幂等：已有的列跳过；多 worker 同时启动撞 Duplicate column 也当成功。
+    DDL 失败只记日志，不阻断启动 —— 少一列的服务总比起不来的服务好。
+    返回 {"added": [...], "failed": [...], "extra": [...]}；extra 是库里有、模型里
+    没有的列（比如历史遗留的 work_orders.machine_id），只报告，不动。
     """
     import logging
 
     import app.models  # noqa: F401  确保所有模型都已注册到 metadata
+    from sqlalchemy import inspect
 
-    column = "is_test"
+    result: dict[str, list[str]] = {"added": [], "failed": [], "extra": []}
     try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT TABLE_NAME FROM information_schema.COLUMNS "
-                    "WHERE TABLE_SCHEMA = :db AND COLUMN_NAME = :col"
-                ),
-                {"db": settings.db_name, "col": column},
-            ).fetchall()
-        have = {row[0] for row in rows}
-        missing = [
-            name
-            for name, table in Base.metadata.tables.items()
-            if column in table.columns and name not in have
-        ]
-        done: list[str] = []
-        for name in missing:
-            try:
-                with engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"ALTER TABLE `{name}` "
-                            f"ADD COLUMN {column} TINYINT(1) NOT NULL DEFAULT 0"
-                        )
-                    )
-                done.append(name)
-            except Exception as e:  # 并发启动时另一 worker 刚加过
-                logging.warning("补 %s.%s 失败（并发时属正常）: %s", name, column, e)
-        if done:
-            logging.warning("数据域列已补齐 %d 张表: %s", len(done), ", ".join(done))
-        return done
+        insp = inspect(engine)
+        existing_tables = set(insp.get_table_names())
+        for table_name, table in Base.metadata.tables.items():
+            if table_name not in existing_tables:
+                continue  # 缺表由 create_all 负责
+            columns = insp.get_columns(table_name)
+            have = {c["name"] for c in columns}
+            for col in table.columns:
+                if col.name in have:
+                    continue
+                if not apply:
+                    result["added"].append(f"{table_name}.{col.name}")
+                    continue
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text(_column_ddl(table_name, col)))
+                    result["added"].append(f"{table_name}.{col.name}")
+                except Exception as e:  # 并发 ADD 撞 Duplicate column 属正常
+                    result["failed"].append(f"{table_name}.{col.name}: {str(e)[:90]}")
+            result["extra"].extend(
+                f"{table_name}.{c}" for c in sorted(have - {c.name for c in table.columns})
+            )
+        if apply and result["added"]:
+            logging.warning("表结构已补齐: %s", ", ".join(result["added"]))
+        if apply:
+            for item in result["failed"]:
+                logging.warning("补列失败（并发时属正常）: %s", item)
     except Exception as e:
-        logging.warning("检查数据域列失败，跳过: %s", e)
-        return []
+        logging.warning("检查表结构失败，跳过: %s", e)
+    return result
