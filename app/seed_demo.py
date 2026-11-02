@@ -487,7 +487,24 @@ def main() -> None:
     parser.add_argument(
         "--reset", action="store_true", help="先清空所有 is_test=1 的数据再重新写入"
     )
+    parser.add_argument(
+        "--skip-schema",
+        action="store_true",
+        help="跳过灌数据前的表结构对齐（默认会先补齐模型里新增的列）",
+    )
     args = parser.parse_args()
+
+    # 灌数据前先对齐表结构。这个项目没有独立的迁移执行环节（deploy.sh 只 pull + build），
+    # 生产库已经因此连着踩过两次：缺 is_test 列全站 500、缺 machines.model 让种子写不进去。
+    # 放在这里而不是只靠启动钩子，是为了「单独跑一次 seed 就能修好」。
+    if not args.skip_schema:
+        from app.database import ensure_schema
+
+        fixed = ensure_schema()
+        if fixed.get("added"):
+            print(f"灌数据前已补齐 {len(fixed['added'])} 列：{', '.join(fixed['added'])}")
+        if fixed.get("failed"):
+            print("以下列补失败（灌数据可能中断）：", "; ".join(fixed["failed"]))
 
     db = SessionLocal()
     try:

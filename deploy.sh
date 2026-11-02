@@ -87,6 +87,17 @@ info "4/6 重启服务（后台常驻）..."
 $COMPOSE up -d --remove-orphans
 ok "容器已启动"
 
+#----------- 4.5 对齐表结构 -----------#
+# create_all 只建缺失的表，从不 ALTER 已存在的表；而这里没有独立的迁移执行环节，
+# 结果就是「代码上线、库没改」→ 查询报 Unknown column → 全站 500。
+# ensure_schema 只补缺失的列（不删不改），幂等，失败也不阻断部署。
+info "4.5/6 对齐表结构（补齐模型新增的列）..."
+if $COMPOSE exec -T web python -m app.ensure_schema 2>&1 | tail -20; then
+    ok "表结构已对齐"
+else
+    warn "表结构对齐失败，服务仍会启动，但涉及新列的接口会报错，请检查上面的输出"
+fi
+
 #----------- 5. 健康检查 -----------#
 info "5/6 等待服务就绪..."
 HEALTHY=false
