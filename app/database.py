@@ -120,5 +120,56 @@ def init_db():
         import logging
         logging.warning("create_all 并发冲突，已忽略: %s", e)
 
-    # from app.models import order, production  # noqa: F401
-    # Base.metadata.create_all(bind=engine)
+    ensure_tenant_columns()
+
+
+def ensure_tenant_columns() -> list[str]:
+    """给缺少 is_test 列的既有表补列，返回补齐的表名。
+
+    create_all 只建「缺失的表」，从不 ALTER「已存在的表」；而 deploy.sh 只有
+    git pull + 重建镜像，没有迁移步骤。于是「代码上线了、库没改」会让所有带数据域
+    过滤的查询直接 500（Unknown column 'orders.is_test'）—— 生产上踩过一次：
+    /api/orders、/api/employees 全挂，只有登录这类不查库的接口是好的。
+
+    这里在启动时幂等地补一遍：只 ADD 缺的列，已经有的跳过；多 worker 同时启动
+    撞到 Duplicate column 也当成功。DDL 失败只记日志，不阻断启动。
+    """
+    import logging
+
+    import app.models  # noqa: F401  确保所有模型都已注册到 metadata
+
+    column = "is_test"
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT TABLE_NAME FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = :db AND COLUMN_NAME = :col"
+                ),
+                {"db": settings.db_name, "col": column},
+            ).fetchall()
+        have = {row[0] for row in rows}
+        missing = [
+            name
+            for name, table in Base.metadata.tables.items()
+            if column in table.columns and name not in have
+        ]
+        done: list[str] = []
+        for name in missing:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE `{name}` "
+                            f"ADD COLUMN {column} TINYINT(1) NOT NULL DEFAULT 0"
+                        )
+                    )
+                done.append(name)
+            except Exception as e:  # 并发启动时另一 worker 刚加过
+                logging.warning("补 %s.%s 失败（并发时属正常）: %s", name, column, e)
+        if done:
+            logging.warning("数据域列已补齐 %d 张表: %s", len(done), ", ".join(done))
+        return done
+    except Exception as e:
+        logging.warning("检查数据域列失败，跳过: %s", e)
+        return []
