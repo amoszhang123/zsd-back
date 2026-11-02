@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     wx_app_secret: str = ""
     mp_mock_phone: str = ""
 
+    # 小程序提审用的「固定验证码登录」。默认关闭：关闭时 /mp/sms-code 与
+    # /mp/sms-login 直接返回 404，外部看来这两个接口根本不存在。
+    # 只有在 开关打开 + 手机号精确匹配 + 验证码精确匹配 三个条件同时成立时才签发
+    # token，且错误文案统一，不能让调用方区分「这个号没开通」和「码不对」——
+    # 否则等于把白名单里的手机号告诉了对方。
+    mp_sms_test_enabled: bool = False
+    mp_sms_test_phone: str = ""
+    mp_sms_test_code: str = ""
+
     # 员工二维码 token 的签名密钥（见 routers/mp.py 的 _mint_qr_token）。
     # 默认值只是为了本地开发方便，**正式环境必须在 .env 里换成随机串** ——
     # 它写死在源码里，任何能看到代码的人都能伪造出任意员工的二维码。

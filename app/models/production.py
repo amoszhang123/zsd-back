@@ -3,7 +3,7 @@ from datetime import date, datetime
 from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
-from app.database import Base
+from app.database import Base, TenantScoped
 
 
 # 员工属性（用工形式）：直属 / 外包。新建时默认直属，
@@ -25,7 +25,7 @@ POSITION_QC = "质检"
 POSITION_ADMIN = "管理员"
 
 
-class Employee(Base):
+class Employee(TenantScoped, Base):
     __tablename__ = "employees"
 
     id: Mapped[str] = mapped_column(String(10), primary_key=True)
@@ -39,7 +39,7 @@ class Employee(Base):
     employee_type: Mapped[str] = mapped_column(String(10), default=EMPLOYEE_TYPE_DIRECT)
 
 
-class Machine(Base):
+class Machine(TenantScoped, Base):
     """加工机台。
 
     id 由系统生成（MC0001 递增），不再由人填 —— 机台上贴的静态二维码里装的就是
@@ -56,7 +56,7 @@ class Machine(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
-class WorkOrder(Base):
+class WorkOrder(TenantScoped, Base):
     """开工单（派工单）：可含多名负责员工、多个订单。
 
     同一名员工名下同时只能有一张**未完工**的开工单（必须完工结单才能开下一张），
@@ -80,7 +80,7 @@ class WorkOrder(Base):
     )
 
 
-class WorkOrderEmployee(Base):
+class WorkOrderEmployee(TenantScoped, Base):
     __tablename__ = "work_order_employees"
     __table_args__ = (
         UniqueConstraint("work_order_id", "employee_id", name="uq_work_order_employee"),
@@ -104,7 +104,7 @@ class WorkOrderEmployee(Base):
     employee: Mapped["Employee"] = relationship()
 
 
-class WorkOrderItem(Base):
+class WorkOrderItem(TenantScoped, Base):
     __tablename__ = "work_order_items"
     __table_args__ = (UniqueConstraint("work_order_id", "order_id", name="uq_work_order_order"),)
 
@@ -123,7 +123,7 @@ class WorkOrderItem(Base):
     machine: Mapped["Machine | None"] = relationship()
 
 
-class OrderContribution(Base):
+class OrderContribution(TenantScoped, Base):
     """订单参与度：一个订单由多名员工分多个开工单接力完成时，记录各自占比。
 
     由把订单做到全量完成的那名员工在完工时统一填写，合计必须为 100%。
@@ -150,7 +150,7 @@ class OrderContribution(Base):
     employee: Mapped["Employee"] = relationship()
 
 
-class OrderProgrammer(Base):
+class OrderProgrammer(TenantScoped, Base):
     """订单 ↔ 编程人。
 
     一张订单可能被多名编程员工先后接手（改刀路、补工序、返工重编），所以用关联表

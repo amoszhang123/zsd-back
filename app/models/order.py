@@ -8,7 +8,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 import enum
 
-from app.database import Base
+from app.database import Base, TenantScoped
 
 
 class StepStatus(str, enum.Enum):
@@ -25,7 +25,7 @@ ORDER_TYPE_HALF_OUTSOURCE = "半外协"
 ORDER_TYPES = (ORDER_TYPE_SELF, ORDER_TYPE_FULL_OUTSOURCE, ORDER_TYPE_HALF_OUTSOURCE)
 
 
-class Order(Base):
+class Order(TenantScoped, Base):
     __tablename__ = "orders"
 
     id: Mapped[str] = mapped_column(String(20), primary_key=True)
@@ -124,7 +124,7 @@ def resolve_order_status(order: "Order", in_production_ids: set[str] | None = No
     return ORDER_STATUS_LABELS[order.current_step]
 
 
-class OrderStep(Base):
+class OrderStep(TenantScoped, Base):
     __tablename__ = "order_steps"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -139,7 +139,7 @@ class OrderStep(Base):
     order: Mapped["Order"] = relationship(back_populates="steps")
 
 
-class OrderMaterial(Base):
+class OrderMaterial(TenantScoped, Base):
     __tablename__ = "order_materials"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -152,7 +152,7 @@ class OrderMaterial(Base):
     order: Mapped["Order"] = relationship(back_populates="materials")
 
 
-class QualityResult(Base):
+class QualityResult(TenantScoped, Base):
     """质检结果。stage 区分首检(quality1)与终检(quality2)，同一订单每阶段各一行。"""
 
     __tablename__ = "quality_results"

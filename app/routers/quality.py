@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
-from app.database import get_db
+from app.database import get_db, scoped
 from app.models.order import (
     ORDER_TYPE_FULL_OUTSOURCE,
     PRODUCTION_STEP,
@@ -52,7 +52,10 @@ def _upstream_qty_map(db: Session, stage: str) -> dict[str, int]:
     if STAGE_UPSTREAM[stage] is None:
         rows = (
             db.query(WorkOrderItem.order_id, func.sum(WorkOrderItem.completed_qty))
-            .filter(WorkOrderItem.completed_qty.isnot(None))
+            .filter(
+                WorkOrderItem.completed_qty.isnot(None),
+                scoped(db, WorkOrderItem),
+            )
             .group_by(WorkOrderItem.order_id)
             .all()
         )
@@ -66,6 +69,7 @@ def _upstream_qty_map(db: Session, stage: str) -> dict[str, int]:
                 Order.order_type == ORDER_TYPE_FULL_OUTSOURCE,
                 Order.current_step >= QUALITY1_STEP,
                 Order.quantity > 0,
+                scoped(db, Order),
             )
             .all()
         )
@@ -75,7 +79,10 @@ def _upstream_qty_map(db: Session, stage: str) -> dict[str, int]:
 
     rows = (
         db.query(QcInspection.order_id, func.sum(QcInspection.pass_count))
-        .filter(QcInspection.stage == STAGE_UPSTREAM[stage])
+        .filter(
+            QcInspection.stage == STAGE_UPSTREAM[stage],
+            scoped(db, QcInspection),
+        )
         .group_by(QcInspection.order_id)
         .all()
     )

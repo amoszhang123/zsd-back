@@ -1,12 +1,15 @@
 import hashlib
 import json
+import os
 import re
 import secrets
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, HTTPException, Header, Response, UploadFile
@@ -15,7 +18,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
-from app.database import get_db
+from app.database import get_db, scoped
 from app.models.contract import blocked_orders
 from app.models.order import (
     PROGRAM_STEP,
@@ -284,6 +287,116 @@ def check_phone(req: CheckPhoneRequest, db: Session = Depends(get_db)):
     )
 
 
+# ------------------------- 提审用的固定验证码登录 -------------------------
+#
+# 微信审核员没有公司微信、也没有能走 getPhoneNumber 的账号，微信一键登录在他们
+# 那儿必然失败，小程序就会以「无法登录/无法体验」被拒。所以补一个「手机号 + 固定
+# 验证码」入口：不发真短信，验证码写在后端配置里。
+#
+# 三条同时成立才签发，缺一条都回同一句错误：
+#   1. MP_SMS_TEST_ENABLED 打开（默认关；关闭时两个接口直接 404）
+#   2. 手机号 == MP_SMS_TEST_PHONE
+#   3. 验证码 == MP_SMS_TEST_CODE，且 10 分钟内确实请求过一次验证码
+# 错误文案统一，是为了不让人区分「这个号没开通」和「码不对」——
+# 否则等于把白名单里的手机号告诉了对方。
+
+SMS_CODE_TTL = 600        # 验证码有效期（秒）
+SMS_RESEND_SECONDS = 60   # 同一手机号的重新获取间隔
+
+# 发送记录落共享文件，理由与 token 相同：生产是多 worker，「获取验证码」和
+# 「提交验证码」很可能落到不同进程，存内存会出现「刚发的码转头就说没发过」。
+_SMS_FILE = Path(os.getenv("SMS_CODE_FILE", "/tmp/zsd_sms_codes.json"))
+_sms_lock = threading.Lock()
+
+
+def _load_sms_sent() -> dict[str, float]:
+    try:
+        with open(_SMS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_sms_sent(data: dict[str, float]) -> None:
+    tmp = _SMS_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, _SMS_FILE)
+
+
+def _require_sms_enabled() -> None:
+    """开关关闭时按「接口不存在」处理，审核结束关掉就彻底没有入口。"""
+    if not settings.mp_sms_test_enabled:
+        raise HTTPException(404, "Not Found")
+
+
+class MpSmsCodeRequest(BaseModel):
+    phone: str = Field(min_length=6, max_length=20)
+
+
+class MpSmsCodeResponse(BaseModel):
+    sent: bool
+    expires_in: int
+    # 还要等多少秒才能重新获取（前端倒计时以它为准，不自己拍 60）
+    resend_in: int
+
+
+@router.post("/sms-code", response_model=MpSmsCodeResponse)
+def send_sms_code(req: MpSmsCodeRequest):
+    """「获取验证码」：不真发短信，只记一次发送时间用于倒计时和有效期。"""
+    _require_sms_enabled()
+    phone = req.phone.strip()
+    now = time.time()
+    with _sms_lock:
+        data = _load_sms_sent()
+        last = float(data.get(phone, 0))
+        remain = int(SMS_RESEND_SECONDS - (now - last))
+        if remain <= 0:
+            data[phone] = now
+            _save_sms_sent(data)
+            remain = SMS_RESEND_SECONDS
+    return MpSmsCodeResponse(sent=True, expires_in=SMS_CODE_TTL, resend_in=remain)
+
+
+class MpSmsLoginRequest(BaseModel):
+    phone: str = Field(min_length=6, max_length=20)
+    code: str = Field(min_length=4, max_length=8)
+
+
+@router.post("/sms-login", response_model=WxLoginResponse)
+def sms_login(req: MpSmsLoginRequest):
+    """固定验证码登录。签发的 token 与 wx-login 完全同构，只多一个 is_test 标记 ——
+    数据域由这个标记决定，登录之后的流程一行都不用改。"""
+    _require_sms_enabled()
+    phone = req.phone.strip()
+    code = req.code.strip()
+
+    ok_phone = bool(settings.mp_sms_test_phone) and phone == settings.mp_sms_test_phone
+    ok_code = bool(settings.mp_sms_test_code) and code == settings.mp_sms_test_code
+    with _sms_lock:
+        data = _load_sms_sent()
+        sent_at = float(data.get(phone, 0))
+    if not (ok_phone and ok_code) or time.time() - sent_at > SMS_CODE_TTL:
+        raise HTTPException(400, "验证码错误或已失效，请重新获取")
+
+    # 用过即作废：同一个码不能反复换 token
+    with _sms_lock:
+        data = _load_sms_sent()
+        data.pop(phone, None)
+        _save_sms_sent(data)
+
+    token = secrets.token_hex(24)
+    _set_token(token, {
+        "username": phone,
+        "name": phone,
+        "role": "employee",
+        "phone": phone,
+        "is_test": True,
+        "expires": (datetime.now() + timedelta(hours=24)).isoformat(),
+    })
+    return WxLoginResponse(token=token, phone=phone)
+
+
 @router.post("/bind-employee")
 def bind_employee(req: BindRequest, db: Session = Depends(get_db)):
     emp = db.query(Employee).filter(
@@ -390,6 +503,10 @@ def mp_qr_login_scan(
     工种没有对应网页账号时返回 403，文案由 auth.scan_qr_login 给。
     """
     emp = _current_employee(user, db)
+    if emp.is_test:
+        # 测试账号岗位是「管理员」，不拦就会被映射到 web 的 admin 账号，
+        # 等于把真实生产后台连同写权限一起交出去，隔离直接白做。
+        raise HTTPException(403, "当前账号不支持登录管理后台")
     return MpQrLoginScanOut(**scan_qr_login(req.challenge, emp.phone, emp.name, emp.position))
 
 
@@ -758,7 +875,12 @@ def _require_operator(emp: Employee) -> None:
     """开工单是操作工的活。前端只藏了入口，接口层必须自己拦 ——
     否则管理员/编程/质检拿到 token 就能替车间开工、完工、改产量。
     只读查看（列表 / 详情）不受此限制。
+
+    测试账号（is_test）例外：它是微信审核用的演示身份，岗位并集覆盖
+    操作工/编程/质检三条链路，否则审核员永远点不到开工与质检。
     """
+    if emp.is_test:
+        return
     if emp.position != POSITION_OPERATOR:
         raise HTTPException(
             403,
@@ -811,6 +933,7 @@ def _work_order_detail(
                 WorkOrderItem.order_id.in_(order_ids),
                 WorkOrderItem.work_order_id != work_order.id,
                 WorkOrderItem.completed_qty.isnot(None),
+                scoped(db, WorkOrderItem),
             )
             .group_by(WorkOrderItem.order_id)
             .all()
@@ -895,7 +1018,10 @@ def _resolve_scanned_order(db: Session, candidates: list[str]) -> Order:
             return matched[0]
         if matched:
             total = (
-                db.query(func.count(Order.id)).filter(Order.order_no == cand).scalar() or 0
+                db.query(func.count(Order.id))
+                .filter(Order.order_no == cand, scoped(db, Order))
+                .scalar()
+                or 0
             )
             raise HTTPException(
                 400,
@@ -1047,6 +1173,38 @@ def quick_scan(req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Dep
         current_step=order.current_step,
         action="reject",
     )
+
+    if emp.is_test:
+        # 审核账号是岗位并集，一个码要能串起整条流程，所以按"这张单现在最该
+        # 干的事"分流。顺序有讲究：有待检数量就先去质检（上游已经做完），
+        # 停在程序阶段且没填时长就去编程，还能开工就开工，其余当只读详情。
+        detail = _order_detail(db, order, emp)
+        if any(st.pending_qty > 0 for st in detail.qc_stages):
+            out.action = "qc"
+            return out
+        if _can_edit_program(order):
+            out.action = "program"
+            return out
+        add_error = _order_add_error(db, order)
+        if add_error is None:
+            work_order, is_new = _get_or_create_open_work_order(db, emp)
+            err = _work_order_add_error(db, work_order, order)
+            if err is None:
+                db.add(WorkOrderItem(work_order_id=work_order.id, order_id=order.id))
+                db.commit()
+                out.work_order_id = work_order.id
+                out.work_order_is_new = is_new
+                out.action = "work_order_added"
+                out.message = (
+                    f"订单 {order.id} 已加入{'新建的' if is_new else ''}开工单 #{work_order.id}"
+                )
+                return out
+            # 已经在别的开工单里之类：不新增，但也没必要拦着看详情
+            out.message = err
+        else:
+            out.message = add_error
+        out.action = "order_detail"
+        return out
 
     if emp.position == POSITION_ADMIN:
         # 管理员不参与生产，扫码只为查看。订单详情对管理员已放开全量可见，
@@ -1473,6 +1631,8 @@ def _can_edit_program(order: Order) -> bool:
 
 
 def _require_programmer(emp: Employee) -> None:
+    if emp.is_test:
+        return
     if emp.position != POSITION_PROGRAMMER:
         raise HTTPException(
             403,
@@ -1482,6 +1642,8 @@ def _require_programmer(emp: Employee) -> None:
 
 
 def _require_qc(emp: Employee) -> None:
+    if emp.is_test:
+        return
     if emp.position != POSITION_QC:
         raise HTTPException(
             403,
@@ -1557,7 +1719,9 @@ def _my_order_ids(
     质检岗：所有待质检的订单 + 我质检过的订单。
     其它岗：我参与生产过的订单（order_contributions 里有我的记录）。
     """
-    if emp.position == POSITION_ADMIN:
+    if emp.position == POSITION_ADMIN or emp.is_test:
+        # 测试账号按管理员口径看全厂：演示库里就十几张单，审核员要能一次看全
+        # 各个阶段的样例单，而不是只有他"参与过"的那几张
         return [row[0] for row in db.query(Order.id).all()]
 
     if emp.position == POSITION_PROGRAMMER:
@@ -1598,14 +1762,18 @@ def _visible_order(db: Session, order_id: str, emp: Employee) -> Order:
     if not order:
         raise HTTPException(404, f"订单不存在: {order_id}")
     # 管理员的可见范围就是全厂，不必再把全量 id 拉出来做成员判断
-    if emp.position != POSITION_ADMIN and order_id not in _my_order_ids(db, emp):
+    if (
+        emp.position != POSITION_ADMIN
+        and not emp.is_test
+        and order_id not in _my_order_ids(db, emp)
+    ):
         raise HTTPException(403, f"订单 {order_id} 不在你的「我的订单」范围内")
     return order
 
 
 def _order_detail(db: Session, order: Order, emp: Employee) -> MpOrderDetailOut:
     status = resolve_order_status(order, in_production_order_ids(db, [order.id]))
-    is_qc = emp.position == POSITION_QC
+    is_qc = emp.position == POSITION_QC or emp.is_test
 
     qc_stage = ""
     qc_pending_qty = 0
@@ -1664,7 +1832,8 @@ def _order_detail(db: Session, order: Order, emp: Employee) -> MpOrderDetailOut:
         machining_minutes=order.machining_minutes,
         estimated_hours=order.estimated_hours,
         # 绿色编辑按钮只给编程岗，否则质检员会看到一个点了就 403 的按钮
-        can_edit=_can_edit_program(order) and emp.position == POSITION_PROGRAMMER,
+        can_edit=_can_edit_program(order)
+        and (emp.position == POSITION_PROGRAMMER or emp.is_test),
         can_judge=is_qc and qc_pending_qty > 0,
         qc_stage=qc_stage,
         qc_stage_label=STAGE_LABELS.get(qc_stage, ""),
@@ -1701,8 +1870,10 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
     质检岗 = 所有待质检 + 我质检过的；其它岗 = 我参与生产过的。
     """
     emp = _current_employee(user, db)
-    is_programmer = emp.position == POSITION_PROGRAMMER
-    is_qc = emp.position == POSITION_QC
+    # 测试账号是岗位并集：列表里每张单都同时带「待编程」「待质检」状态，
+    # 审核员不用换账号就能看到三条链路的入口
+    is_programmer = emp.position == POSITION_PROGRAMMER or emp.is_test
+    is_qc = emp.position == POSITION_QC or emp.is_test
 
     # 待检映射算一次，_my_order_ids 和下面的行构造共用，别重复扫三张表
     qc_pending = _qc_pending_by_order(db) if is_qc else {}

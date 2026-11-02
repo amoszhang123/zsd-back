@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import get_db, scoped
 from app.models.contract import blocked_orders
 from app.models.order import ORDER_STATUS_LABELS, PRODUCTION_STEP, QUALITY1_STEP, Order
 from app.models.production import (
@@ -327,6 +327,7 @@ def complete_work(req: CompleteWorkRequest, db: Session = Depends(get_db)):
             WorkOrderItem.order_id.in_(order_ids),
             WorkOrderItem.work_order_id != work_order.id,
             WorkOrderItem.completed_qty.isnot(None),
+            scoped(db, WorkOrderItem),
         )
         .group_by(WorkOrderItem.order_id)
         .all()
@@ -361,7 +362,7 @@ def complete_work(req: CompleteWorkRequest, db: Session = Depends(get_db)):
 def completed_qty_by_order(db: Session = Depends(get_db)):
     rows = (
         db.query(WorkOrderItem.order_id, func.sum(WorkOrderItem.completed_qty))
-        .filter(WorkOrderItem.completed_qty.isnot(None))
+        .filter(WorkOrderItem.completed_qty.isnot(None), scoped(db, WorkOrderItem))
         .group_by(WorkOrderItem.order_id)
         .all()
     )

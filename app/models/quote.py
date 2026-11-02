@@ -3,10 +3,10 @@ from datetime import datetime
 from sqlalchemy import DateTime, Double, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.database import Base
+from app.database import Base, TenantScoped
 
 
-class Quote(Base):
+class Quote(TenantScoped, Base):
     """报价记录单（本地）。主键由日期 + 时间戳生成，如 BJ20261002-1790526095635。
 
     报价单只是报价留档，不生成工单；确认接单走原有的接单管理流程。
@@ -24,7 +24,7 @@ class Quote(Base):
     )
 
 
-class QuoteItem(Base):
+class QuoteItem(TenantScoped, Base):
     """报价明细。price（报价单价）与 delivery（交期）由人工填写，总价 = price × quantity 实时计算。"""
 
     __tablename__ = "quote_items"

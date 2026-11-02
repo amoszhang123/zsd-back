@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy import DateTime, Double, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 
-from app.database import Base
+from app.database import Base, TenantScoped
 from app.models.order import Order
 from app.models.production import Employee
 
@@ -16,7 +16,7 @@ DISPOSITION_TYPE_LABELS = {"rework": "返工单", "scrap": "报废单", "repair"
 DISPOSITION_COST_LABELS = {"scrap": "物料损失", "rework": "额外支出", "repair": "额外支出"}
 
 
-class DispositionBase(Base):
+class DispositionBase(TenantScoped, Base):
     """返工/报废/维修三种单据的公共字段。"""
 
     __abstract__ = True
@@ -67,7 +67,7 @@ class RepairOrder(DispositionBase):
     )
 
 
-class DispositionOwner(Base):
+class DispositionOwner(TenantScoped, Base):
     """返工/报废/维修单的负责人（多选）与逐人损耗。
 
     三种单据共用这一张表，用 disposition_type + disposition_id 定位所属单据。
@@ -101,7 +101,7 @@ class DispositionOwner(Base):
     employee: Mapped["Employee"] = relationship()
 
 
-class QcInspection(Base):
+class QcInspection(TenantScoped, Base):
     """质检批次：一个订单在同一阶段可以有多条，支持部分完成、部分质检。
 
     待检数量 = 上游产出数量 − 本阶段已检数量之和，其中上游产出口径为

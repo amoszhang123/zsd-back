@@ -3,7 +3,7 @@ from datetime import date, datetime
 from sqlalchemy import Date, DateTime, Double, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
-from app.database import Base
+from app.database import Base, TenantScoped
 from app.models.order import PRODUCTION_STEP, SHIPPING_STEP, Order, resolve_order_status
 from app.models.production import in_production_order_ids
 
@@ -34,7 +34,7 @@ ALLOWED_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
 BLOCKING_STATUSES = (CONTRACT_STATUS_PAUSED, CONTRACT_STATUS_CANCELLED, CONTRACT_STATUS_CLOSED)
 
 
-class Contract(Base):
+class Contract(TenantScoped, Base):
     """购销合同：由 Excel 导入解析生成，主键为 HT + 采购单号。"""
 
     __tablename__ = "contracts"
@@ -63,7 +63,7 @@ class Contract(Base):
     )
 
 
-class ContractItem(Base):
+class ContractItem(TenantScoped, Base):
     """合同工件明细。delivery 存 Excel 原值（可能是 1、2 这类整数，也可能为空）。"""
 
     __tablename__ = "contract_items"

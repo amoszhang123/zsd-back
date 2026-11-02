@@ -128,13 +128,18 @@ def require_admin(user: dict = Depends(get_current_user)):
 
 
 def _issue_session(username: str, user: dict) -> LoginResponse:
-    """签发一个 24 小时的 web 会话。账号密码登录与扫码登录共用，避免两处各写一份。"""
+    """签发一个 24 小时的 web 会话。账号密码登录与扫码登录共用，避免两处各写一份。
+
+    web 后台只有生产域：账号密码登录天然是生产数据域；扫码登录在 mp_qr_login_scan
+    里已经拒绝了测试账号，所以这里恒写 is_test=False。
+    """
     token = secrets.token_hex(24)
     _set_token(token, {
         "username": username,
         "name": user["name"],
         "role": user["role"],
         "position": user["position"],
+        "is_test": False,
         "expires": (datetime.now() + timedelta(hours=24)).isoformat(),
     })
     return LoginResponse(

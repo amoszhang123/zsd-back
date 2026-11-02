@@ -20,7 +20,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import get_db, scoped
 from app.machine_label import MachineLabelData, render_machine_label
 from app.models.production import (
     WORK_ORDER_STATUS_DONE,
@@ -47,7 +47,13 @@ router = APIRouter(prefix="/api/machines", tags=["machines"])
 
 def _next_machine_code(db: Session) -> str:
     """MC0001 递增。编号定长零填充，所以字符串 max() 就是数值 max()。"""
-    last = db.query(func.max(Machine.id)).filter(Machine.id.like("MC%")).scalar()
+    # 这条必须带数据域：测试域占用 MC8001-MC8999 号段，若不过滤，生产域新建机台
+    # 会从 max(MC8004) 往后编成 MC8005，直接撞进测试号段
+    last = (
+        db.query(func.max(Machine.id))
+        .filter(Machine.id.like("MC%"), scoped(db, Machine))
+        .scalar()
+    )
     seq = 1
     if last and re.fullmatch(r"MC\d{4}", last):
         seq = int(last[2:]) + 1
@@ -76,7 +82,7 @@ def _stats_map(db: Session, machine_ids: list[str]) -> dict[str, dict]:
             func.max(WorkOrder.created_at),
         )
         .join(WorkOrder, WorkOrder.id == WorkOrderItem.work_order_id)
-        .filter(WorkOrderItem.machine_id.in_(machine_ids))
+        .filter(WorkOrderItem.machine_id.in_(machine_ids), scoped(db, WorkOrderItem))
         .group_by(WorkOrderItem.machine_id)
         .all()
     )

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import get_db, scoped
 from app.models.order import (
     ORDER_STATUS_LABELS,
     PRODUCTION_STEP,
@@ -157,10 +157,15 @@ def _build_alerts(db: Session) -> list[DashboardAlert]:
 
 def _quality_rate(db: Session) -> tuple[float | None, int]:
     """送检合格率 = Σ合格数 / Σ送检数（含质检1、表处、质检2 三个阶段的全部批次）。"""
-    passed, total = db.query(
-        func.coalesce(func.sum(QcInspection.pass_count), 0),
-        func.coalesce(func.sum(QcInspection.quantity), 0),
-    ).one()
+    passed, total = (
+        db.query(
+            func.coalesce(func.sum(QcInspection.pass_count), 0),
+            func.coalesce(func.sum(QcInspection.quantity), 0),
+        )
+        # 聚合语句不会走全局数据域过滤，必须显式补条件（见 database.scoped）
+        .filter(scoped(db, QcInspection))
+        .one()
+    )
     total = int(total or 0)
     if not total:
         return None, 0
@@ -171,11 +176,17 @@ def _quality_rate(db: Session) -> tuple[float | None, int]:
 def get_stats(db: Session = Depends(get_db)):
     today = date.today()
     today_orders = (
-        db.query(func.count(Order.id)).filter(Order.create_date == today).scalar() or 0
+        db.query(func.count(Order.id))
+        .filter(Order.create_date == today, scoped(db, Order))
+        .scalar() or 0
     )
     in_production = (
         db.query(func.count(Order.id))
-        .filter(Order.current_step >= PRODUCTION_STEP, Order.current_step < SHIPPING_STEP)
+        .filter(
+            Order.current_step >= PRODUCTION_STEP,
+            Order.current_step < SHIPPING_STEP,
+            scoped(db, Order),
+        )
         .scalar() or 0
     )
     # 今天生成的出货单张数（原来这里数的是「所有 step>=7 的工单」，与「今日」无关）
@@ -184,9 +195,11 @@ def get_stats(db: Session = Depends(get_db)):
         .filter(func.date(Shipment.created_at) == today)
         .scalar() or 0
     )
-    total = db.query(func.count(Order.id)).scalar() or 0
+    total = db.query(func.count(Order.id)).filter(scoped(db, Order)).scalar() or 0
     completed = (
-        db.query(func.count(Order.id)).filter(Order.current_step >= SHIPPING_STEP).scalar() or 0
+        db.query(func.count(Order.id))
+        .filter(Order.current_step >= SHIPPING_STEP, scoped(db, Order))
+        .scalar() or 0
     )
     quality_rate, quality_sample = _quality_rate(db)
 
@@ -248,14 +261,22 @@ def _hours_by_employee(db: Session, start: datetime, end: datetime) -> tuple[
             QcInspection.order_id.label("order_id"),
             func.min(QcInspection.created_at).label("finished_at"),
         )
-        .filter(QcInspection.stage == "quality1", QcInspection.verdict == "pass")
+        .filter(
+            QcInspection.stage == "quality1",
+            QcInspection.verdict == "pass",
+            scoped(db, QcInspection),
+        )
         .group_by(QcInspection.order_id)
         .subquery()
     )
     finished = (
         db.query(first_pass.c.order_id, Order.estimated_hours)
         .join(Order, Order.id == first_pass.c.order_id)
-        .filter(first_pass.c.finished_at >= start, first_pass.c.finished_at < end)
+        .filter(
+            first_pass.c.finished_at >= start,
+            first_pass.c.finished_at < end,
+            scoped(db, Order),
+        )
         .all()
     )
     if not finished:
@@ -269,7 +290,7 @@ def _hours_by_employee(db: Session, start: datetime, end: datetime) -> tuple[
             OrderContribution.employee_id,
             OrderContribution.percent,
         )
-        .filter(OrderContribution.order_id.in_(order_ids))
+        .filter(OrderContribution.order_id.in_(order_ids), scoped(db, OrderContribution))
         .all()
     )
 
@@ -310,6 +331,7 @@ def _output_by_employee(db: Session, start: datetime, end: datetime) -> dict[str
             WorkOrder.work_date >= start.date(),
             WorkOrder.work_date < end.date(),
             WorkOrderItem.completed_qty.isnot(None),
+            scoped(db, WorkOrderItem),
         )
         .group_by(WorkOrderEmployee.employee_id)
         .all()
@@ -331,6 +353,7 @@ def _output_total(db: Session, start: datetime, end: datetime) -> int:
             WorkOrder.work_date >= start.date(),
             WorkOrder.work_date < end.date(),
             WorkOrderItem.completed_qty.isnot(None),
+            scoped(db, WorkOrderItem),
         )
         .scalar()
     )
@@ -352,6 +375,7 @@ def _defects_by_employee(db: Session, start: datetime, end: datetime) -> dict[st
                 model.employee_id.isnot(None),
                 model.created_at >= start,
                 model.created_at < end,
+                scoped(db, model),
             )
             .group_by(model.employee_id)
             .all()
