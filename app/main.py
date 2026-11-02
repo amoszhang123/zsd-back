@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -14,11 +15,29 @@ from app.routers import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    _log_login_switches()
     # 演示数据默认不灌，避免清空数据库后被自动填回来。需要时设 AUTO_SEED=true
     if settings.auto_seed:
         from app.seed import seed_if_empty
         seed_if_empty()
     yield
+
+
+def _log_login_switches() -> None:
+    """把两个登录开关的状态打到启动日志里。
+
+    「固定验证码登录」关闭时接口按设计返回 404，和「路由不存在」长得一模一样，
+    曾经让人在生产上排查了半天。启动时打一行，`docker compose logs web | grep 登录`
+    就能确认到底是没开开关、还是代码没上线。
+    """
+    log = logging.getLogger("uvicorn.error")
+    if settings.mp_sms_test_enabled:
+        log.warning(
+            "短信登录已开启：仅 %s 可用固定验证码登录（提审期间用，审核结束请关闭）",
+            settings.mp_sms_test_phone or "<未配置手机号，实际无人可用>",
+        )
+    else:
+        log.info("短信登录未开启：/mp/sms-code 与 /mp/sms-login 返回 404")
 
 
 app = FastAPI(
