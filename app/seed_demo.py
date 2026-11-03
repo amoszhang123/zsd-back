@@ -25,7 +25,17 @@ from app.models.contract import (
     Contract,
     ContractItem,
 )
-from app.models.order import STEP_KEYS, STEP_LABELS, Order, OrderMaterial, OrderStep, QualityResult
+from app.models.order import (
+    MATERIAL_PREP_ENABLED,
+    MATERIAL_STEP,
+    PROGRAM_STEP,
+    STEP_KEYS,
+    STEP_LABELS,
+    Order,
+    OrderMaterial,
+    OrderStep,
+    QualityResult,
+)
 from app.models.production import (
     Employee,
     Machine,
@@ -191,6 +201,11 @@ def _seed_orders(db) -> dict[str, Order]:
     for idx, (oid, step, product, model, material_no, qty, hours, due, order_type) in enumerate(
         ORDERS
     ):
+        # 备料总开关关闭时，种子数据里「备料中」的两张单也一并挪到程序阶段：
+        # 否则重灌演示数据后它们会卡在一个界面上看不到待办的阶段
+        # （web 备料页此时只渲染空状态提示），看着像数据丢了。
+        if not MATERIAL_PREP_ENABLED and step == MATERIAL_STEP:
+            step = PROGRAM_STEP
         order = Order(
             id=oid,
             order_no=f"OD800{idx + 1:03d}",
@@ -436,7 +451,11 @@ def _seed_programmers(db) -> None:
 
 
 def _seed_materials(db, orders: dict[str, Order]) -> None:
-    """备料阶段的两张单给出物料清单，web 端备料页/缺料提醒才有内容。"""
+    """给两张单挂上物料清单（BOM）。
+
+    备料总开关关闭时它们已落到程序阶段，备料页不再展示，但清单本身要留着 ——
+    缺料提醒、恢复备料后的待备料列表都靠它。
+    """
     for oid, names in {
         "WO80004AA": ["45# 圆钢", "内六角螺钉"],
         "WO80013AA": ["尼龙垫片", "定位销"],

@@ -104,6 +104,8 @@ class BatchConfirmRequest(BaseModel):
     # 默认 True：跳过备料，工单停在程序阶段（备料标记为已完成）。
     # False：不跳过，停在备料阶段，与单张接单一致。
     # 前端两处（web OrderList / 小程序 orderIntake）都是默认勾选。
+    # 注意：备料总开关 MATERIAL_PREP_ENABLED 关闭时本参数不参与判定，一律进程序，
+    # 前端也不会再渲染这个勾选框（见 GET /api/orders/flow-config）。
     # 全外协忽略此参数，恒进质检1。
     skip_material: bool = True
 

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.database import get_db
 from app.models.contract import Contract, ContractItem, blocked_orders
 from app.models.order import (
+    MATERIAL_PREP_ENABLED,
     ORDER_STATUS_LABELS,
     PROGRAM_STEP,
     STEP_KEYS,
@@ -16,6 +17,7 @@ from app.models.order import (
     Order,
     OrderStep,
     batch_confirm_target_step,
+    confirm_target_step,
     hours_from_machining_minutes,
     resolve_order_status,
 )
@@ -34,6 +36,19 @@ from app.schemas.order import (
 )
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
+
+
+@router.get("/flow-config")
+def get_flow_config():
+    """流程开关的只读配置，给前端决定界面用。
+
+    这里必须声明在 /{order_id} 之前，否则 "flow-config" 会被当成工单号吃掉。
+
+    目前只暴露备料环节：material_prep_enabled=False 时，接单管理要隐藏
+    「跳过备料阶段」勾选框、备料管理页只渲染空状态提示；
+    后端把这个常量改回 True，前端会自动恢复出勾选框与任务列表。
+    """
+    return {"material_prep_enabled": MATERIAL_PREP_ENABLED}
 
 
 def _build_steps(order_id: str) -> list[OrderStep]:
@@ -265,7 +280,8 @@ def batch_confirm(req: BatchConfirmRequest, db: Session = Depends(get_db)):
     """批量接单。整批一个订单类型，外加一个「跳过备料阶段」开关，
     目标阶段由 batch_confirm_target_step 统一裁定：
 
-    自主 / 半外协：勾选跳过备料（默认）→ 齐备/程序(step 2)；不勾选 → 备料中(step 1)。
+    备料总开关关闭（现阶段）→ 自主/半外协恒为齐备/程序(step 2)，skip_material 不入判定。
+    备料总开关打开：勾选跳过备料（默认）→ 齐备/程序(step 2)；不勾选 → 备料中(step 1)。
     全外协：恒为质检中(step 4)，开关对其无效。
     目标阶段之前的一切阶段一律标记为已完成。
     """
@@ -397,6 +413,9 @@ def advance_step(order_id: str, db: Session = Depends(get_db)):
 def confirm_order(order_id: str, db: Session = Depends(get_db)):
     """单张接单。
 
+    落点由 confirm_target_step() 裁定：备料总开关关闭时直接进「程序」，
+    备料节点标记为已完成；打开则仍停在「备料」。
+
     所属合同处于暂停/取消/结案时一律拦下（409）—— 与批量接单同口径，
     否则界面上置灰了按钮，直接调接口还是能接单。
     """
@@ -418,10 +437,13 @@ def confirm_order(order_id: str, db: Session = Depends(get_db)):
         raise HTTPException(400, f"该工单已确认接单，当前状态：{status}")
 
     steps = sorted(order.steps, key=lambda s: s.sort_order)
-    steps[0].status = "completed"
-    steps[0].time = date.today()
-    order.current_step = 1
-    steps[1].status = "processing"
+    target = confirm_target_step()
+    today = date.today()
+    for idx in range(target):
+        steps[idx].status = "completed"
+        steps[idx].time = today
+    order.current_step = target
+    steps[target].status = "processing"
     db.commit()
     db.refresh(order)
     return _respond(db, order)
@@ -469,7 +491,7 @@ def get_qrcode(order_id: str, db: Session = Depends(get_db)):
 
 @router.get("/{order_id}/label")
 def get_label(order_id: str, db: Session = Depends(get_db)):
-    """订单码标签 PNG（100×70mm @300DPI），供 web 端接单管理预览与打印。
+    """订单码标签 PNG（80×60mm @300DPI），供 web 端接单管理预览与打印。
 
     右上角序号取合同明细 seq，右下角交期取工单 deadline；
     二维码与 /qrcode 同一份内容，跨「物料编码/物料名称」两行贴在右侧。
@@ -494,5 +516,5 @@ def get_label(order_id: str, db: Session = Depends(get_db)):
         seq=str(item.seq) if item and item.seq else "",
         deadline=f"{order.deadline.month}月{order.deadline.day}日" if order.deadline else "",
     )
-    return StreamingResponse(io.BytesIO(render_label(data, order_qr_image(order))),
+    return StreamingResponse(io.BytesIO(render_label(data, order_qr_image(order, box_size=1))),
                              media_type="image/png")

@@ -702,9 +702,9 @@ def list_material_movements(material_id: int, db: Session = Depends(get_db)):
 
 @router.post("/labels", response_model=LabelPagesOut)
 def batch_labels(req: LabelRequest, db: Session = Depends(get_db)):
-    """批量出 A4 拼版（4×9=36 张/页），返回每页 PNG 的 data URI 给前端打印。
+    """批量出 A4 拼版（2×4=8 张/页），返回每页 PNG 的 data URI 给前端打印。
 
-    为什么不让前端逐张 <img> 再排版：50×30 的标签在 A4 上必须严格对齐，
+    为什么不让前端逐张 <img> 再排版：80×60 的标签在 A4 上必须严格对齐，
     浏览器打印的缩放/边距每家不同，很容易印出来偏半毫米而切歪。
     """
     materials = db.query(Material).filter(Material.id.in_(req.ids)).all()

@@ -98,17 +98,42 @@ def hours_from_machining_minutes(minutes: float) -> float:
     return float(hours.quantize(_HOURS_QUANTUM, rounding=ROUND_HALF_UP))
 
 
+# 备料环节总开关。
+#
+# False = 现阶段不需要备料：接单（单张 / 批量）后一律直接进「程序」阶段，
+#         备料节点标记为已完成。备料管理菜单保留但只显示空状态提示，
+#         「一键领料」接口与页面都还在，恢复后立即可用。
+# True  = 恢复「接单 → 备料 → 程序」老流程。
+#
+# 这是唯一开关：单张接单、批量接单都读它；web 端通过 GET /api/orders/flow-config
+# 拿到同一份值来决定界面（勾选框显示与否、提示文案），所以恢复备料只需要把这里
+# 改回 True，前端零改动。
+MATERIAL_PREP_ENABLED = False
+
+
+def confirm_target_step() -> int:
+    """单张接单后工单落到的阶段。
+
+    历史行为是恒进备料(step 1)，不按订单类型分流（全外协走厂内流程的兜底）；
+    总开关关闭时直接进程序(step 2)，语义仍是「备料已完成」。
+    """
+    return MATERIAL_STEP if MATERIAL_PREP_ENABLED else PROGRAM_STEP
+
+
 def batch_confirm_target_step(order_type: str, skip_material: bool = True) -> int:
     """批量接单后工单落到的阶段。
 
     全外协不在厂内生产，恒进质检1，skip_material 对它无效。
 
     自主 / 半外协：
+      总开关关闭         → 恒进程序阶段，skip_material 不再生效（前端也不再给这个勾选框）；
       跳过备料（默认勾选）→ 停在程序阶段，备料标记为已完成，等编程人员填加工时长；
       不跳过备料          → 停在备料阶段，与单张接单一致，领料后再往下流转。
     """
     if order_type == ORDER_TYPE_FULL_OUTSOURCE:
         return QUALITY1_STEP
+    if not MATERIAL_PREP_ENABLED:
+        return PROGRAM_STEP
     return PROGRAM_STEP if skip_material else MATERIAL_STEP
 
 

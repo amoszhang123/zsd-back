@@ -267,7 +267,7 @@ def machine_label(machine_id: str, db: Session = Depends(get_db)):
 
 @router.post("/labels", response_model=LabelPagesOut)
 def batch_labels(req: MachineLabelRequest, db: Session = Depends(get_db)):
-    """批量出图。100×70 热敏一页一张，N 台就是 N 页，前端按页插分页符连着打。"""
+    """批量出图。80×60 热敏一页一张，N 台就是 N 页，前端按页插分页符连着打。"""
     machines = db.query(Machine).filter(Machine.id.in_(req.ids)).all()
     by_id = {m.id: m for m in machines}
     ordered = [by_id[i] for i in req.ids if i in by_id]

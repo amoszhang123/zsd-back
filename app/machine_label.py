@@ -1,4 +1,4 @@
-"""机台二维码标签（静态二维码），100×70mm @300DPI 热敏。
+"""机台二维码标签（静态二维码），80×60mm @300DPI 热敏。
 
 为什么是静态码、为什么单独一份文件而不是复用订单标签：
   - 机台码贴在机器上，一辈子不换，所以内容是固定的
@@ -23,10 +23,20 @@ from app.order_label import _font
 
 DPI = 300
 
-# 100×70mm
-LABEL_W = round(100 / 25.4 * DPI)  # 1181
-LABEL_H = round(70 / 25.4 * DPI)   # 827
+# 80×60mm（全厂热敏标签统一规格）
+LABEL_W = round(80 / 25.4 * DPI)   # 945
+LABEL_H = round(60 / 25.4 * DPI)   # 709
 MARGIN = round(2 / 25.4 * DPI)     # 2mm 静区，热敏头边缘打不到
+
+# 与订单标签同一套处理：版式原本按 100mm 宽设计，缩到 80mm 时字号同步缩，
+# 否则「MC0001」这行 92px 的编号会顶出右边界。
+_DESIGN_W = 1181
+S = LABEL_W / _DESIGN_W
+
+
+def _px(design_px: int) -> int:
+    return max(1, round(design_px * S))
+
 
 BLACK = (26, 26, 26)
 GRAY = (120, 120, 120)
@@ -91,7 +101,7 @@ def render_machine_label(data: MachineLabelData) -> bytes:
     ih = y1 - y0
 
     # 左栏放码、右栏放字。左栏宽度按「二维码够大且不挤」定 0.40；
-    # 420px ≈ 35.5mm 见方，手机隔三四十厘米就能扫上
+    # 80×60 下约 27mm 见方，手机隔三四十厘米就能扫上
     left_w = round((x1 - x0) * 0.40)
     split_x = x0 + left_w
 
@@ -99,18 +109,18 @@ def render_machine_label(data: MachineLabelData) -> bytes:
     draw.line([(split_x, y0), (split_x, y1)], fill=BORDER, width=2)
 
     # ---- 左栏：二维码 + 底部提示 ----
-    pad = 22
-    caption_top = y1 - 70  # 提示行的上沿，二维码不得越过它
+    pad = _px(22)
+    caption_top = y1 - _px(70)  # 提示行的上沿，二维码不得越过它
     side = min(left_w - pad * 2, caption_top - y0 - pad * 2)
     qr = machine_qr_image(data.code, side)
     qr_x = x0 + (left_w - side) // 2
     # 在「上边框」到「提示行上沿」之间垂直居中，否则码贴顶、下面空一大块
     qr_y = y0 + pad + (caption_top - y0 - pad * 2 - side) // 2
     img.paste(qr, (qr_x, qr_y))
-    _text(draw, (x0 + left_w // 2, y1 - 46), "扫码关联开工单", 30, GRAY, anchor="mm")
+    _text(draw, (x0 + left_w // 2, y1 - _px(46)), "扫码关联开工单", _px(30), GRAY, anchor="mm")
 
     # ---- 右栏：编号 / 名称 / 型号 三行 ----
-    pad_r = 30
+    pad_r = _px(30)
     tx = split_x + pad_r
     right_w = x1 - pad_r - tx
 
@@ -124,18 +134,18 @@ def render_machine_label(data: MachineLabelData) -> bytes:
 
     def cell(idx, label, value, size, color, bold=False):
         top, bot = ys[idx], ys[idx + 1]
-        _text(draw, (tx, top + 16), label, 28, GRAY)
-        _text(draw, (tx, bot - 26), _clip(draw, value, size, right_w), size, color,
+        _text(draw, (tx, top + _px(16)), label, _px(28), GRAY)
+        _text(draw, (tx, bot - _px(26)), _clip(draw, value, size, right_w), size, color,
               bold=bold, anchor="ls")
 
-    cell(0, "机台编号", data.code or "—", 92, TEAL, bold=True)
-    cell(1, "机台名称", data.name or "—", 54, BLACK)
-    cell(2, "型    号", data.model or "—", 54, BLACK)
+    cell(0, "机台编号", data.code or "—", _px(92), TEAL, bold=True)
+    cell(1, "机台名称", data.name or "—", _px(54), BLACK)
+    cell(2, "型    号", data.model or "—", _px(54), BLACK)
 
     # 停用机台照打（人可能先打一批备着），但必须一眼看出来，否则贴上去才发现
     # 扫不了。这里用右上角红字，不占正文位置
     if not data.active:
-        _text(draw, (x1 - pad_r, y0 + 14), "已停用", 34, RED, bold=True, anchor="ra")
+        _text(draw, (x1 - pad_r, y0 + _px(14)), "已停用", _px(34), RED, bold=True, anchor="ra")
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")

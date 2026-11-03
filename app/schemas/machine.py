@@ -60,7 +60,7 @@ class MachineHistoryItem(BaseModel):
 
 
 class LabelPagesOut(BaseModel):
-    """100×70 热敏一页一张，前端按页插入分页符连着打。"""
+    """80×60 热敏一页一张，前端按页插入分页符连着打。"""
 
     pages: list[str] = []
 

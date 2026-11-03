@@ -1050,14 +1050,17 @@ def _work_order_rows(work_orders: list[WorkOrder]) -> list[MpWorkOrderOut]:
 def list_my_work_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
     """我名下的开工单，按开工时间倒序。
 
-    管理员是只读查看：返回全厂开工单，can_start 恒为 False ——
+    真正的管理员（非测试账号）是只读查看：返回全厂开工单，can_start 恒为 False ——
     前端「新建开工单」按钮由这个字段驱动，所以不会显示出来。
+
+    测试账号岗位也是「管理员」，但它是岗位并集（必须能演示开工），不能走上面那条
+    只读分支 —— 否则它名下历史单全完工了，按钮还是灰的，提示里还会出现 "#null"。
     """
     emp = _current_employee(user, db)
     # items 要用来算 item_count，不 joinedload 就会逐张单懒加载一次
     query = db.query(WorkOrder).options(joinedload(WorkOrder.items))
 
-    if emp.position == POSITION_ADMIN:
+    if emp.position == POSITION_ADMIN and not emp.is_test:
         work_orders = query.order_by(
             WorkOrder.created_at.desc(), WorkOrder.id.desc()
         ).all()
@@ -1067,13 +1070,21 @@ def list_my_work_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db
             open_work_order_id=None,
         )
 
-    work_orders = (
-        query.join(WorkOrderEmployee, WorkOrderEmployee.work_order_id == WorkOrder.id)
-        .filter(WorkOrderEmployee.employee_id == emp.id)
-        .order_by(WorkOrder.created_at.desc(), WorkOrder.id.desc())
-        .all()
-    )
-    open_wo = next((w for w in work_orders if w.status != WORK_ORDER_STATUS_DONE), None)
+    if emp.is_test:
+        # 演示库里就几张单，全给出去；正式操作工只看自己参与过的
+        work_orders = query.order_by(
+            WorkOrder.created_at.desc(), WorkOrder.id.desc()
+        ).all()
+    else:
+        work_orders = (
+            query.join(WorkOrderEmployee, WorkOrderEmployee.work_order_id == WorkOrder.id)
+            .filter(WorkOrderEmployee.employee_id == emp.id)
+            .order_by(WorkOrder.created_at.desc(), WorkOrder.id.desc())
+            .all()
+        )
+    # 是否还能开工，必须和建单（create_my_work_order）用同一个查询，
+    # 否则会出现「列表里只剩完工单、开工按钮却还是灰的」这种自相矛盾
+    open_wo = _open_work_order(db, emp.id)
     return MpWorkOrderListOut(
         work_orders=_work_order_rows(work_orders),
         can_start=open_wo is None,
@@ -2222,8 +2233,10 @@ def mp_admin_confirm_order(
 def mp_admin_batch_confirm(
     req: BatchConfirmRequest, user=Depends(_get_mp_user), db: Session = Depends(get_db)
 ):
-    """批量接单。目标阶段由订单类型 + skip_material 共同决定：
-    自主/半外协勾选「跳过备料阶段」（默认）→ 齐备/程序，不勾选 → 备料中；
+    """批量接单。目标阶段由订单类型 + 备料总开关 + skip_material 共同决定：
+
+    备料总开关关闭（现阶段）→ 自主/半外协恒为齐备/程序，skip_material 不参与判定；
+    开关打开时勾选「跳过备料阶段」（默认）→ 齐备/程序，不勾选 → 备料中。
     全外协恒为质检中，开关无效。
     合同状态非「正常」的、以及不在待确认阶段的都会被跳过并在 skipped 里回报原因。
     """

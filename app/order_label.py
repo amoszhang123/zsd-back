@@ -4,7 +4,7 @@
 原图是手机拍的屏幕，带摩尔纹、反光和 Excel 标签页，直接当底图会把瑕疵一起
 打印到热敏纸上。这里只借用它的版面与配色。
 
-版面（100×70mm，300 DPI）：
+版面（80×60mm，300 DPI）：
     ┌────────┬────────────────────────────┬────────┐
     │  ZSD   │ 订单号：xxx                │   121  │  ← 右上角=合同序号
     │ 展晟达 ├────────────────────────────┤        │
@@ -24,11 +24,22 @@ from dataclasses import dataclass
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
 
-# 100×70mm @ 300 DPI
+# 80×60mm @ 300 DPI（全厂热敏标签统一规格）
 DPI = 300
-LABEL_W = round(100 / 25.4 * DPI)  # 1181
-LABEL_H = round(70 / 25.4 * DPI)   # 827
+LABEL_W = round(80 / 25.4 * DPI)   # 945
+LABEL_H = round(60 / 25.4 * DPI)   # 709
 MARGIN = round(2 / 25.4 * DPI)     # 2mm 静区，热敏头边缘打不到
+
+# 版式最初是按 100mm 宽设计的。换成 80mm 后所有字号、内边距按同一比例缩，
+# 否则 92px 的右上角序号会把左边的订单号挤掉。
+_DESIGN_W = 1181
+S = LABEL_W / _DESIGN_W
+
+
+def _px(design_px: int) -> int:
+    """把 100mm 版面上的像素值换算到当前标签宽度。"""
+    return max(1, round(design_px * S))
+
 
 # 从模板照片采样的感知色（照片偏暗，这里取屏幕上看到的颜色）。
 # 热敏打印是单色，彩色只影响预览观感。
@@ -118,16 +129,22 @@ def render_label(data: LabelData, qr: Image.Image) -> bytes:
     logo_w = round(iw * 0.24)
     logo_x = x0 + logo_w
 
-    pad = 18
-    val = 46
-    gap = 30
+    pad = _px(12)
+    val = _px(46)
+    gap = _px(30)
 
     # 二维码跨「物料编码 / 物料名称」两行贴右侧。位置要先算出来再画横线，
     # 否则 D/E 之间的横线会穿过二维码
     qr_side = (ys[5] - ys[3]) - pad * 2
-    qr = qr.resize((qr_side, qr_side), Image.NEAREST)
-    qr_x = x1 - pad - qr_side
-    qr_y = ys[3] + pad
+    # 传进来的 qr 是 box_size=1 的模块图（宽 = 模块数），按整数倍放大：
+    # 直接 resize 到任意边长会让模块在 5px/6px 之间跳，便宜的扫码枪会挑片，
+    # 和物料条码、机台码是同一个坑。
+    n = qr.width
+    box = max(1, qr_side // n)
+    side = n * box
+    qr = qr.resize((side, side), Image.NEAREST)
+    qr_x = x1 - pad - side
+    qr_y = ys[3] + pad + (qr_side - side) // 2
     val_right = qr_x - pad   # 物料编码/名称的值不得压到二维码
 
     # 表格线。logo 是合并单元格（ZSD/展晟达 之间无横线），所以 A/B 分隔线只画右半；
@@ -142,24 +159,24 @@ def render_label(data: LabelData, qr: Image.Image) -> bytes:
     # logo 合并单元格：ZSD / 展晟达 在整格里上下居中
     cx = x0 + logo_w // 2
     mid_logo = (y0 + ys[2]) // 2
-    _text(draw, (cx, mid_logo - 42), "ZSD", 54, BLACK, anchor="mm")
-    _text(draw, (cx, mid_logo + 46), "展晟达", 50, BLACK, anchor="mm")
+    _text(draw, (cx, mid_logo - _px(42)), "ZSD", _px(54), BLACK, anchor="mm")
+    _text(draw, (cx, mid_logo + _px(46)), "展晟达", _px(50), BLACK, anchor="mm")
 
     # 右上角序号 / 右下角交期先量宽度，左边的值才知道要让到哪里。
     # 缺数据时留空而不是画「—」：92px 的破折号加描边看着像一根实心条，
     # 「没填交期 / 无合同序号」的提示改由前端预览弹窗负责。
-    seq_w = _bold_width(draw, data.seq, 92)
-    dl_w = _bold_width(draw, data.deadline, 76)
+    seq_w = _bold_width(draw, data.seq, _px(92))
+    dl_w = _bold_width(draw, data.deadline, _px(76))
     if data.seq:
-        _text(draw, (x1 - pad, (ys[0] + ys[1]) // 2), data.seq, 92, PURPLE,
+        _text(draw, (x1 - pad, (ys[0] + ys[1]) // 2), data.seq, _px(92), PURPLE,
               bold=True, anchor="rm")
     if data.deadline:
-        _text(draw, (x1 - pad, (ys[5] + ys[6]) // 2), data.deadline, 76, PURPLE,
+        _text(draw, (x1 - pad, (ys[5] + ys[6]) // 2), data.deadline, _px(76), PURPLE,
               bold=True, anchor="rm")
 
     # 行 A：订单号（logo 右侧起），值不得压到右上角序号
     _lv(draw, logo_x + pad, (ys[0] + ys[1]) // 2, "订单号：", data.order_no or "—",
-        val + 4, PURPLE, True, gap, x1 - pad - seq_w - 24)
+        val + _px(4), PURPLE, True, gap, x1 - pad - seq_w - _px(24))
 
     # 行 B：项目号
     _lv(draw, logo_x + pad, (ys[1] + ys[2]) // 2, "项目号：", data.project_no or "—",
@@ -177,7 +194,7 @@ def render_label(data: LabelData, qr: Image.Image) -> bytes:
 
     # 行 F：数量，值不得压到右下角交期
     _lv(draw, x0 + pad, (ys[5] + ys[6]) // 2, "数量：", f"{data.quantity} pcs",
-        val, TEAL, True, gap, x1 - pad - dl_w - 24)
+        val, TEAL, True, gap, x1 - pad - dl_w - _px(24))
 
     img.paste(qr, (qr_x, qr_y))
 
@@ -193,8 +210,8 @@ def _bold_width(draw, s, size):
 
 def _lv(draw, x, ymid, label, value, vsize, vcolor, vbold, gap, right_limit=None):
     """画「标签：值」一行，值紧跟标签宽度排布；right_limit 给定时超宽自动缩字号。"""
-    _text(draw, (x, ymid), label, 44, BLACK, anchor="lm")
-    vx = x + draw.textlength(label, font=_font(44)) + gap
+    _text(draw, (x, ymid), label, _px(44), BLACK, anchor="lm")
+    vx = x + draw.textlength(label, font=_font(_px(44))) + gap
     if right_limit is not None:
         _draw_fit(draw, (vx, ymid), value, vsize, vcolor, right_limit, bold=vbold)
     else:
@@ -206,7 +223,7 @@ def _draw_fit(draw, xy, s, size, color, right_limit, bold=False):
     x, y = xy
     avail = right_limit - x
     font = _font(size)
-    while size > 24 and draw.textlength(s, font=font) > avail:
+    while size > _px(24) and draw.textlength(s, font=font) > avail:
         size -= 2
         font = _font(size)
     if draw.textlength(s, font=font) > avail:
