@@ -680,6 +680,9 @@ class MpWorkOrderOut(BaseModel):
     created_at: datetime
     completed_at: datetime | None = None
     item_count: int = 0
+    # 这张单是否含当前登录人。管理员看全厂时据此区分「我的」与「只读查看的」，
+    # 前端只在含本人时给出可操作暗示，别的单点进去仍只读
+    is_mine: bool = False
 
 
 class MpWorkOrderListOut(BaseModel):
@@ -688,6 +691,11 @@ class MpWorkOrderListOut(BaseModel):
     # 由后端算好给前端，免得前端自己判断跟建单校验对不上。
     can_start: bool = True
     open_work_order_id: int | None = None
+    # 前端是否显示「全厂 / 我的」切换。管理员与演示账号为 True，
+    # 由后端下发而不是前端按岗位猜，避免两边口径漂移
+    can_view_all: bool = False
+    # 本次返回的是哪个视图，前端据此高亮切换按钮
+    scope: str = "mine"
 
 
 class MpParticipantOut(BaseModel):
@@ -872,19 +880,24 @@ def _work_order_add_error(db: Session, work_order: WorkOrder, order: Order) -> s
 
 
 def _require_operator(emp: Employee) -> None:
-    """开工单是操作工的活。前端只藏了入口，接口层必须自己拦 ——
-    否则管理员/编程/质检拿到 token 就能替车间开工、完工、改产量。
+    """开工单由操作工与管理员共同承担。前端只藏了入口，接口层必须自己拦 ——
+    否则编程/质检拿到 token 就能替车间开工、完工、改产量。
     只读查看（列表 / 详情）不受此限制。
+
+    管理员放开的只是「开工链」：建单 / 扫码加单 / 机台绑定 / 完工结单。
+    程序时长与质检判定仍归编程、质检岗位（见 _require_programmer / _require_qc），
+    别把这里的口子顺手扩到那两条链路上。
 
     测试账号（is_test）例外：它是微信审核用的演示身份，岗位并集覆盖
     操作工/编程/质检三条链路，否则审核员永远点不到开工与质检。
     """
     if emp.is_test:
         return
-    if emp.position != POSITION_OPERATOR:
+    if emp.position not in (POSITION_OPERATOR, POSITION_ADMIN):
         raise HTTPException(
             403,
-            f"只有「{POSITION_OPERATOR}」岗位可以操作开工单，你当前岗位是「{emp.position}」",
+            f"只有「{POSITION_OPERATOR}」或「{POSITION_ADMIN}」岗位可以操作开工单，"
+            f"你当前岗位是「{emp.position}」",
         )
 
 
@@ -1032,7 +1045,9 @@ def _resolve_scanned_order(db: Session, candidates: list[str]) -> Order:
     raise HTTPException(404, f"二维码里的编号「{candidates[0]}」找不到对应订单")
 
 
-def _work_order_rows(work_orders: list[WorkOrder]) -> list[MpWorkOrderOut]:
+def _work_order_rows(
+    work_orders: list[WorkOrder], mine_ids: set[int] | None = None
+) -> list[MpWorkOrderOut]:
     return [
         MpWorkOrderOut(
             id=w.id,
@@ -1041,37 +1056,42 @@ def _work_order_rows(work_orders: list[WorkOrder]) -> list[MpWorkOrderOut]:
             created_at=w.created_at,
             completed_at=w.completed_at,
             item_count=len(w.items),
+            is_mine=w.id in (mine_ids or set()),
         )
         for w in work_orders
     ]
 
 
 @router.get("/work-orders", response_model=MpWorkOrderListOut)
-def list_my_work_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
-    """我名下的开工单，按开工时间倒序。
+def list_my_work_orders(
+    scope: str | None = None,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    """开工单列表，按开工时间倒序。
 
-    真正的管理员（非测试账号）是只读查看：返回全厂开工单，can_start 恒为 False ——
-    前端「新建开工单」按钮由这个字段驱动，所以不会显示出来。
+    scope=mine（默认）→ 只返回含本人的单；scope=all → 全厂。
+    只有管理员能切到 all，操作工/编程/质检传什么都按 mine 处理，不会因为
+    手改参数就看到别人的单。每行带 is_mine，前端据此区分可操作与只读。
 
-    测试账号岗位也是「管理员」，但它是岗位并集（必须能演示开工），不能走上面那条
-    只读分支 —— 否则它名下历史单全完工了，按钮还是灰的，提示里还会出现 "#null"。
+    can_start 一律按「本人名下有无未完工单」算 —— 管理员现在也能开工，
+    不能再像改造前那样恒为 False（那会让他的开工按钮永远是灰的）。
+
+    测试账号（演示身份）默认给全厂，与改造前一致；但它也能切回「我的」。
     """
     emp = _current_employee(user, db)
     # items 要用来算 item_count，不 joinedload 就会逐张单懒加载一次
     query = db.query(WorkOrder).options(joinedload(WorkOrder.items))
 
-    if emp.position == POSITION_ADMIN and not emp.is_test:
-        work_orders = query.order_by(
-            WorkOrder.created_at.desc(), WorkOrder.id.desc()
-        ).all()
-        return MpWorkOrderListOut(
-            work_orders=_work_order_rows(work_orders),
-            can_start=False,
-            open_work_order_id=None,
-        )
+    is_demo = emp.is_test
+    can_view_all = is_demo or emp.position == POSITION_ADMIN
+    if not can_view_all:
+        scope = "mine"
+    elif scope not in ("mine", "all"):
+        # 管理员默认「我的」；演示账号默认「全厂」，保持审核时的观感不变
+        scope = "all" if is_demo else "mine"
 
-    if emp.is_test:
-        # 演示库里就几张单，全给出去；正式操作工只看自己参与过的
+    if scope == "all":
         work_orders = query.order_by(
             WorkOrder.created_at.desc(), WorkOrder.id.desc()
         ).all()
@@ -1082,13 +1102,23 @@ def list_my_work_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db
             .order_by(WorkOrder.created_at.desc(), WorkOrder.id.desc())
             .all()
         )
+
+    # is_mine 标记：一次查完本人参与过的单号，别在循环里逐张查
+    mine_ids = {
+        row[0]
+        for row in db.query(WorkOrderEmployee.work_order_id)
+        .filter(WorkOrderEmployee.employee_id == emp.id)
+        .all()
+    }
     # 是否还能开工，必须和建单（create_my_work_order）用同一个查询，
     # 否则会出现「列表里只剩完工单、开工按钮却还是灰的」这种自相矛盾
     open_wo = _open_work_order(db, emp.id)
     return MpWorkOrderListOut(
-        work_orders=_work_order_rows(work_orders),
+        work_orders=_work_order_rows(work_orders, mine_ids),
         can_start=open_wo is None,
         open_work_order_id=open_wo.id if open_wo else None,
+        can_view_all=can_view_all,
+        scope=scope,
     )
 
 
@@ -1116,14 +1146,21 @@ def create_my_work_order(user=Depends(_get_mp_user), db: Session = Depends(get_d
 def get_my_work_order(
     work_order_id: int, user=Depends(_get_mp_user), db: Session = Depends(get_db)
 ):
+    """开工单详情。
+
+    含本人 → 可操作（加单 / 完工）；不含本人且是管理员 → 只读查看（全厂视图里
+    点进去看别人的单）。普通岗位看别人的单仍然 403，口径与 _owned_work_order 一致。
+    """
     emp = _current_employee(user, db)
-    if emp.position == POSITION_ADMIN:
-        # 管理员只读查看任意开工单（不在其名下也算），动作开关由 readonly 关掉
-        work_order = db.query(WorkOrder).filter(WorkOrder.id == work_order_id).first()
-        if not work_order:
-            raise HTTPException(404, f"开工单不存在: #{work_order_id}")
+    work_order = db.query(WorkOrder).filter(WorkOrder.id == work_order_id).first()
+    if not work_order:
+        raise HTTPException(404, f"开工单不存在: #{work_order_id}")
+    if emp.id in [link.employee_id for link in work_order.employees]:
+        return _work_order_detail(db, work_order)
+    if emp.position == POSITION_ADMIN or emp.is_test:
+        # 管理员 / 演示账号可只读查看任意开工单，动作开关由 readonly 关掉
         return _work_order_detail(db, work_order, readonly=True)
-    return _work_order_detail(db, _owned_work_order(db, work_order_id, emp.id))
+    raise HTTPException(403, f"开工单 #{work_order_id} 不在你名下，无权操作")
 
 
 @router.post("/work-orders/{work_order_id}/scan", response_model=MpWorkOrderDetailOut)
@@ -1162,7 +1199,7 @@ def quick_scan(req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Dep
              /work-orders/{id}/scan 完全一致（同一份 _work_order_add_error）。
     编程   → 订单已到程序阶段才返回 program，否则 reject 让前端弹窗提醒。
     质检   → 订单已有待检阶段才返回 qc，否则 reject。
-    管理员 → 只读查看，返回 order_detail，前端跳订单详情；不参与生产。
+    管理员 → 与操作工同一条开工链路：能加单就加，加不了跳订单详情（并带提示）。
     程序/质检的放行口径与各目标页面自身一致，避免「跳过去才发现做不了」。
     """
     emp = _current_employee(user, db)
@@ -1217,17 +1254,15 @@ def quick_scan(req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Dep
         out.action = "order_detail"
         return out
 
-    if emp.position == POSITION_ADMIN:
-        # 管理员不参与生产，扫码只为查看。订单详情对管理员已放开全量可见，
-        # 所以这里不需要任何阶段判断，扫到什么就看什么
-        out.action = "order_detail"
-        return out
-
-    if emp.position == POSITION_OPERATOR:
-        # 与开工单无关的校验先做：不通过就别新建开工单，免得留下一张空单
+    if emp.position in (POSITION_OPERATOR, POSITION_ADMIN):
+        # 操作工与管理员共用同一条开工链路：能开工就加进本人未完工开工单
+        # （没有就新建一张），工时与参与度都记在扫码人自己头上。
+        # 加不进去时管理员仍跳订单详情（还能看一眼这张单），操作工只弹提示。
         err = _order_add_error(db, order)
         if err:
             out.message = err
+            if emp.position == POSITION_ADMIN:
+                out.action = "order_detail"
             return out
         work_order, is_new = _get_or_create_open_work_order(db, emp)
         out.work_order_id = work_order.id
@@ -1235,6 +1270,8 @@ def quick_scan(req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Dep
         err = _work_order_add_error(db, work_order, order)
         if err:
             out.message = err
+            if emp.position == POSITION_ADMIN:
+                out.action = "order_detail"
             return out
         db.add(WorkOrderItem(work_order_id=work_order.id, order_id=order.id))
         db.commit()
