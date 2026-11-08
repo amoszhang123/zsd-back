@@ -39,12 +39,14 @@ def _px(design_px: int) -> int:
 
 
 BLACK = (26, 26, 26)
-GRAY = (120, 120, 120)
+GRAY = (90, 90, 90)
 TEAL = (21, 112, 137)
 PURPLE = (74, 26, 94)
-BORDER = (120, 120, 120)
 WHITE = (255, 255, 255)
 RED = (200, 40, 40)
+# 表格线纯黑 + 0.34mm：浅灰细线在 203dpi 二值化后会被打散（订单标签踩过这个坑）
+BORDER = (0, 0, 0)
+LINE_W = 4
 
 
 @dataclass
@@ -105,8 +107,8 @@ def render_machine_label(data: MachineLabelData) -> bytes:
     left_w = round((x1 - x0) * 0.40)
     split_x = x0 + left_w
 
-    draw.rectangle([x0, y0, x1, y1], outline=BORDER, width=3)
-    draw.line([(split_x, y0), (split_x, y1)], fill=BORDER, width=2)
+    draw.rectangle([x0, y0, x1, y1], outline=BORDER, width=LINE_W)
+    draw.line([(split_x, y0), (split_x, y1)], fill=BORDER, width=LINE_W)
 
     # ---- 左栏：二维码 + 底部提示 ----
     pad = _px(22)
@@ -130,7 +132,7 @@ def render_machine_label(data: MachineLabelData) -> bytes:
         ys.append(ys[-1] + round(f * ih))
     ys[-1] = y1
     for y in ys[1:-1]:
-        draw.line([(split_x, y), (x1, y)], fill=BORDER, width=2)
+        draw.line([(split_x, y), (x1, y)], fill=BORDER, width=LINE_W)
 
     def cell(idx, label, value, size, color, bold=False):
         top, bot = ys[idx], ys[idx + 1]

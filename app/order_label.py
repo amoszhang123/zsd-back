@@ -47,8 +47,15 @@ def _px(design_px: int) -> int:
 PURPLE = (74, 26, 94)     # 订单号值 / 右上角序号 / 右下角交期
 TEAL = (21, 112, 137)     # 项目号值 / 数量值
 BLACK = (26, 26, 26)      # 标签文字与黑白值
-BORDER = (120, 120, 120)  # 表格线
 WHITE = (255, 255, 255)
+
+# 表格线必须纯黑 + 够粗，不能沿用设计稿的浅灰细线：
+# 打印链路会把 945px 的图降到热敏头的 640 点（203dpi）再二值化抖动，
+# 120 灰 + 2px 的线降采样后只剩零星几个黑点，整条边框会「断续甚至消失」
+# （现场反馈：文字都在，格子线几乎看不到）。
+# 4px @300dpi = 0.34mm ≈ 203dpi 下 2.7 个点，缩一半也还剩 1 个完整点。
+BORDER = (0, 0, 0)
+LINE_W = 4
 
 # 中文字体候选，按优先级取第一个存在的。
 # macOS 开发机与 Linux 生产容器（python:3.12-slim）都要能命中，所以两边的
@@ -167,12 +174,12 @@ def render_label(data: LabelData, qr: Image.Image) -> bytes:
 
     # 表格线。logo 是合并单元格（ZSD/展晟达 之间无横线），所以 A/B 分隔线只画右半；
     # D/E 分隔线在二维码左侧截止
-    draw.rectangle([x0, y0, x1, y1], outline=BORDER, width=3)
-    draw.line([(logo_x, ys[1]), (x1, ys[1])], fill=BORDER, width=2)
+    draw.rectangle([x0, y0, x1, y1], outline=BORDER, width=LINE_W)
+    draw.line([(logo_x, ys[1]), (x1, ys[1])], fill=BORDER, width=LINE_W)
     for y in (ys[2], ys[3], ys[5]):
-        draw.line([(x0, y), (x1, y)], fill=BORDER, width=2)
-    draw.line([(x0, ys[4]), (val_right, ys[4])], fill=BORDER, width=2)
-    draw.line([(logo_x, y0), (logo_x, ys[2])], fill=BORDER, width=2)
+        draw.line([(x0, y), (x1, y)], fill=BORDER, width=LINE_W)
+    draw.line([(x0, ys[4]), (val_right, ys[4])], fill=BORDER, width=LINE_W)
+    draw.line([(logo_x, y0), (logo_x, ys[2])], fill=BORDER, width=LINE_W)
 
     # logo 合并单元格：ZSD / 展晟达 在整格里上下居中
     cx = x0 + logo_w // 2

@@ -34,8 +34,10 @@ PER_PAGE = COLS * ROWS
 
 BLACK = (17, 17, 17)
 GRAY = (110, 110, 110)
-BORDER = (150, 150, 150)
 WHITE = (255, 255, 255)
+# 表格线走纯黑 + 0.34mm，浅灰细线在 203dpi 二值化后会被打散（订单标签踩过这个坑）
+BORDER = (0, 0, 0)
+LINE_W = 4
 
 # 版面纵向分区（px）。原小标签是紧凑排布，换成 80×60 后按新纸面重新分配：
 # 名称/规格在上，条码横贯中部，明文编码与页脚在下，四周留白均匀。
@@ -104,7 +106,7 @@ def render_material_label(data: MaterialLabelData) -> Image.Image:
     draw = ImageDraw.Draw(img)
     inner_w = LABEL_W - PAD * 2
 
-    draw.rectangle([2, 2, LABEL_W - 3, LABEL_H - 3], outline=BORDER, width=3)
+    draw.rectangle([2, 2, LABEL_W - 3, LABEL_H - 3], outline=BORDER, width=LINE_W)
 
     # 名称占主视觉，规格退一档灰字 —— 拣料时先看名字，再核规格
     name, font = _fit(draw, data.name or data.code, 48, inner_w)
