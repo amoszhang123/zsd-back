@@ -700,6 +700,15 @@ def list_material_movements(material_id: int, db: Session = Depends(get_db)):
 
 # ---------------------------------------------------------------- 标签
 
+def _render(fn, *args):
+    """渲染失败转成带原因的 500。未捕获异常会被兜成纯文本 500，
+    前端只能显示「Request failed with status code 500」，看不出是缺字体这类可修问题。"""
+    try:
+        return fn(*args)
+    except Exception as e:
+        raise HTTPException(500, f"标签渲染失败：{e}") from e
+
+
 @router.post("/labels", response_model=LabelPagesOut)
 def batch_labels(req: LabelRequest, db: Session = Depends(get_db)):
     """批量出 A4 拼版（2×4=8 张/页），返回每页 PNG 的 data URI 给前端打印。
@@ -714,7 +723,7 @@ def batch_labels(req: LabelRequest, db: Session = Depends(get_db)):
     if not ordered:
         raise HTTPException(404, "所选物料都不存在")
 
-    pages = render_label_sheet([_label_data(m) for m in ordered])
+    pages = _render(render_label_sheet, [_label_data(m) for m in ordered])
     return LabelPagesOut(
         pages=["data:image/png;base64," + base64.b64encode(p).decode() for p in pages]
     )
@@ -723,7 +732,7 @@ def batch_labels(req: LabelRequest, db: Session = Depends(get_db)):
 @router.get("/{material_id}/label")
 def material_label(material_id: int, db: Session = Depends(get_db)):
     material = _get_material(db, material_id)
-    return Response(content=label_png(_label_data(material)), media_type="image/png")
+    return Response(content=_render(label_png, _label_data(material)), media_type="image/png")
 
 
 def _label_data(m: Material) -> MaterialLabelData:

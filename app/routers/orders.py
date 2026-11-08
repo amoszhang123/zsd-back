@@ -516,5 +516,11 @@ def get_label(order_id: str, db: Session = Depends(get_db)):
         seq=str(item.seq) if item and item.seq else "",
         deadline=f"{order.deadline.month}月{order.deadline.day}日" if order.deadline else "",
     )
-    return StreamingResponse(io.BytesIO(render_label(data, order_qr_image(order, box_size=1))),
-                             media_type="image/png")
+    try:
+        png = render_label(data, order_qr_image(order, box_size=1))
+    except Exception as e:
+        # 未捕获异常会被 Starlette 兜成纯文本 500，前端只能显示
+        # 「Request failed with status code 500」，看不出是字体缺失这种可修问题。
+        # 这里转成带原因的 500，管理端预览弹窗就能直接显示出来。
+        raise HTTPException(500, f"标签渲染失败：{e}") from e
+    return StreamingResponse(io.BytesIO(png), media_type="image/png")

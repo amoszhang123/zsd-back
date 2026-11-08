@@ -258,10 +258,19 @@ def _label_data(m: Machine) -> MachineLabelData:
     return MachineLabelData(code=m.id, name=m.name, model=m.model, active=bool(m.active))
 
 
+def _render(fn, *args) -> bytes:
+    """渲染失败转成带原因的 500。未捕获异常会被兜成纯文本 500，
+    前端只能显示「Request failed with status code 500」，看不出是缺字体这类可修问题。"""
+    try:
+        return fn(*args)
+    except Exception as e:
+        raise HTTPException(500, f"标签渲染失败：{e}") from e
+
+
 @router.get("/{machine_id}/label")
 def machine_label(machine_id: str, db: Session = Depends(get_db)):
     machine = _get_machine(db, machine_id)
-    return Response(content=render_machine_label(_label_data(machine)),
+    return Response(content=_render(render_machine_label, _label_data(machine)),
                     media_type="image/png")
 
 
@@ -276,7 +285,7 @@ def batch_labels(req: MachineLabelRequest, db: Session = Depends(get_db)):
 
     return LabelPagesOut(
         pages=[
-            "data:image/png;base64," + base64.b64encode(render_machine_label(_label_data(m))).decode()
+            "data:image/png;base64," + base64.b64encode(_render(render_machine_label, _label_data(m))).decode()
             for m in ordered
         ]
     )

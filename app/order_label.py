@@ -20,6 +20,7 @@
     └─────────────────────────────────────┴────────┘
 """
 from dataclasses import dataclass
+import os
 
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
@@ -49,8 +50,18 @@ BLACK = (26, 26, 26)      # 标签文字与黑白值
 BORDER = (120, 120, 120)  # 表格线
 WHITE = (255, 255, 255)
 
-# 中文字体候选，按优先级取第一个存在的。macOS 上 STHeiti / Hiragino 都在。
+# 中文字体候选，按优先级取第一个存在的。
+# macOS 开发机与 Linux 生产容器（python:3.12-slim）都要能命中，所以两边的
+# 常见路径都列上：生产镜像里由 dockerfile 的 fonts-wqy-microhei 提供，
+# 少了这一项，容器里渲染标签会直接抛「找不到可用中文字体」。机台码、物料码
+# 也复用这个 _font()，字体缺失是三个标签一起挂。
 _FONT_CANDIDATES = [
+    # Linux（生产容器；wqy 由 dockerfile 安装）
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+    # macOS（本机开发）
     "/System/Library/Fonts/STHeiti Medium.ttc",
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
@@ -62,15 +73,22 @@ _font_cache: dict[int, ImageFont.FreeTypeFont] = {}
 
 def _font(size: int) -> ImageFont.FreeTypeFont:
     if size not in _font_cache:
+        # 允许用环境变量指定字体，现场换字体不用改代码重打镜像
+        candidates = [os.environ["ZSD_LABEL_FONT"]] if os.environ.get("ZSD_LABEL_FONT") else []
+        candidates += _FONT_CANDIDATES
         last_err = None
-        for path in _FONT_CANDIDATES:
+        for path in candidates:
             try:
                 _font_cache[size] = ImageFont.truetype(path, size)
                 break
             except OSError as e:
                 last_err = e
         else:
-            raise RuntimeError(f"找不到可用中文字体，候选：{_FONT_CANDIDATES}") from last_err
+            raise RuntimeError(
+                "找不到可用中文字体，标签无法渲染。请在容器内安装中文字体"
+                "（dockerfile 已装 fonts-wqy-microhei），或用环境变量 ZSD_LABEL_FONT "
+                f"指定字体文件路径。候选：{candidates}"
+            ) from last_err
     return _font_cache[size]
 
 
