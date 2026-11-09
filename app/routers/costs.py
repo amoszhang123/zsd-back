@@ -178,13 +178,25 @@ def remove_invoice(db: Session, invoice: CostInvoice) -> int:
     return cost_id
 
 
-@router.post("", response_model=CostRecordOut)
-def create_cost(req: CostRecordIn, db: Session = Depends(get_db)):
+def create_cost_record(req: CostRecordIn, db: Session) -> CostRecordOut:
+    """新建一条成本记录。web 与小程序共用，小程序那边只多一道管理员校验。
+
+    刻意不接收 material_id / stocked_qty：入库的唯一入口是物料管理的 stock-in，
+    新建时必然是「未入库」，两个端都不可能绕过那道流程。
+    is_test 不用管 —— Session 的 before_flush 会按当前 token 自动打标。
+    """
     record = CostRecord(**req.model_dump())
     db.add(record)
     db.commit()
     db.refresh(record)
-    return _to_out(record)
+    # 走 record_out 而不是 _to_out：让出参与 web 端逐字段一致（含空的 invoices 列表），
+    # 多一次查询换两个端不会在字段上分叉，值得。
+    return record_out(db, record)
+
+
+@router.post("", response_model=CostRecordOut)
+def create_cost(req: CostRecordIn, db: Session = Depends(get_db)):
+    return create_cost_record(req, db)
 
 
 @router.get("", response_model=list[CostRecordOut])

@@ -73,6 +73,7 @@ from app.routers.contracts import (
 )
 from app.routers.costs import (
     attach_invoice,
+    create_cost_record,
     get_cost_or_404,
     list_cost_records,
     record_out,
@@ -102,7 +103,7 @@ from app.schemas.contract import (
     ContractStatusUpdate,
     ContractSummary,
 )
-from app.schemas.cost import CostInvoiceOut, CostRecordOut
+from app.schemas.cost import CostInvoiceOut, CostRecordIn, CostRecordOut
 from app.schemas.order import (
     BatchConfirmRequest,
     BatchConfirmResponse,
@@ -2338,10 +2339,11 @@ def submit_my_judgment(
     )
 
 
-# ---------------- 成本管理（仅管理员：只看 + 补发票） ----------------
-# 小程序端刻意不做新增/编辑/删除，也不做纳入库存/撤销入库：
-# 手机上录 8 个字段再选物料入库，误操作代价太高，而成本是财务数据。
-# 现场真正需要的是「拍张发票补上去」，这件事只有手机做得最快。
+# ---------------- 成本管理（仅管理员：看板 + 补发票 + 记一笔） ----------------
+# 小程序端放开「新增」，仍不做编辑/删除，也不做纳入库存/撤销入库：
+# 改数、删记录、入库都涉及账实一致，错误代价高且需要看全局上下文，
+# 留在 web 端。现场真正高频的是两件事 —— 买完当场记一笔、拍张发票补上去。
+# 录错了不提供撤销，卡片展开区和列表顶部都提示「要改请到 web 端」。
 
 
 @router.get("/costs", response_model=list[CostRecordOut])
@@ -2352,6 +2354,22 @@ def mp_list_costs(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
     """
     _require_admin(user, db, "成本管理")
     return list_cost_records(db)
+
+
+@router.post("/costs", response_model=CostRecordOut)
+def mp_create_cost(
+    req: CostRecordIn,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    """记一笔支出。业务逻辑全走 costs.create_cost_record，与 web 是同一条路径。
+
+    这里只负责把门：成本是财务数据（单价、供应商、支出总额），车间员工 403。
+    新建记录的数据域由 Session 的 before_flush 自动打标，
+    测试账号录的不会混进真实账目，也不需要业务代码判断。
+    """
+    _require_admin(user, db, "成本管理")
+    return create_cost_record(req, db)
 
 
 @router.post("/costs/{cost_id}/invoices", response_model=CostRecordOut)
