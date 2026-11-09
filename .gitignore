@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+
+# 上传的发票图片（宿主机持久化，不进仓库）与部署备份
+uploads/
+backups/

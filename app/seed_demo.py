@@ -17,6 +17,7 @@ import argparse
 from datetime import date, datetime, timedelta
 
 from app.database import SessionLocal
+from app.invoice_storage import delete_invoice_file, save_invoice_image
 from app.models.contract import (
     CONTRACT_STATUS_CANCELLED,
     CONTRACT_STATUS_CLOSED,
@@ -25,6 +26,7 @@ from app.models.contract import (
     Contract,
     ContractItem,
 )
+from app.models.cost import CostInvoice, CostRecord
 from app.models.order import (
     MATERIAL_PREP_ENABLED,
     MATERIAL_STEP,
@@ -65,6 +67,9 @@ NOW = datetime.now()
 # 清空时的顺序：先子后父，否则外键会拦。
 # 顺序即依赖顺序，改动模型时请同步维护这张表。
 DELETE_ORDER = [
+    # 发票先于成本：子表在前，父表在后
+    CostInvoice,
+    CostRecord,
     DispositionOwner,
     RepairOrder,
     ReworkOrder,
@@ -159,6 +164,14 @@ def _reset(db) -> None:
     显式写成 is_test == True —— 全局过滤器不生效时更要想清楚删的是什么。
     """
     print("清空测试数据（只删 is_test=1 的行）：")
+    # 发票图在磁盘上，删行不会带走文件：先把测试域的路径记下来，删完再清盘。
+    # 不这么做的话，反复 --reset 会在 uploads 里堆一批谁也认不出的孤儿图片。
+    stray_files = [
+        path
+        for (path,) in db.query(CostInvoice.file_path)
+        .filter(CostInvoice.is_test.is_(True))
+        .all()
+    ]
     total = 0
     for model in DELETE_ORDER:
         n = db.query(model).filter(model.is_test.is_(True)).delete(synchronize_session=False)
@@ -166,6 +179,9 @@ def _reset(db) -> None:
         if n:
             print(f"  {model.__tablename__:<24} -{n}")
     db.commit()
+    removed = sum(1 for path in stray_files if delete_invoice_file(path))
+    if removed:
+        print(f"  {'uploads/invoices':<24} -{removed}")
     print(f"  共删除 {total} 行")
 
 
@@ -473,6 +489,124 @@ def _seed_materials(db, orders: dict[str, Order]) -> None:
             )
 
 
+# 成本样例（小程序成本页 + web 成本页都会看到）。
+# 第二条故意「已开票但没图」：审核员点「只看缺票」时得有东西可看，
+# 否则「发票可以后补」这个流程在演示里根本走不通。
+# 字段：(类别, 规格, 数量, 单价, 供应商, 已开票, 备注, 距今天数)
+COSTS = [
+    ("刀具", "φ6 四刃铣刀（涂层）", 20, 68.0, "昆山锐工精密刀具", True, "车间常用规格，按月备货", 1),
+    ("油品", "20L 桶装切削液", 4, 385.0, "苏州恒润化工", True, "票在财务处，还没拍照", 9),
+]
+
+
+def _sample_invoice_png() -> bytes:
+    """画一张最简版式的发票样例图。
+
+    为什么要费劲画：审核员点进成本页，那笔「已开票」的记录点开如果是空白或裂图，
+    会让人以为发票功能没做完。画一张示意图最省事，也不用联网找素材。
+    画不出来就跳过（_seed_costs 里已经兜住），绝不阻断种子。
+    """
+    import io
+
+    from PIL import Image, ImageDraw
+
+    from app.order_label import _font
+
+    width, height = 900, 600
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([20, 20, width - 20, height - 20], outline=(190, 60, 60), width=3)
+
+    def centered(text: str, y: int, size: int, fill=(30, 30, 30)) -> None:
+        font = _font(size)
+        draw.text(((width - draw.textlength(text, font=font)) / 2, y), text, font=font, fill=fill)
+
+    centered("增值税电子普通发票", 44, 34, (170, 30, 30))
+    centered("（样例，仅用于演示）", 92, 18, (150, 150, 150))
+    draw.line([40, 126, width - 40, 126], fill=(190, 60, 60), width=2)
+
+    f16, f18 = _font(18), _font(20)
+    for row, text in enumerate(
+        [
+            "发票代码：032002100311",
+            "发票号码：08873426",
+            "开票日期：2026 年 11 月 02 日",
+            "购买方：苏州展晟达精密科技有限公司",
+            "销售方：昆山锐工精密刀具有限公司",
+        ]
+    ):
+        draw.text((60, 150 + row * 30), text, font=f16, fill=(60, 60, 60))
+
+    draw.line([60, 320, width - 60, 320], fill=(200, 200, 200), width=1)
+    for x, text in ((60, "货物或应税劳务名称"), (480, "数量"), (600, "单价"), (740, "金额")):
+        draw.text((x, 334), text, font=f16, fill=(90, 90, 90))
+    draw.line([60, 366, width - 60, 366], fill=(200, 200, 200), width=1)
+    for x, text in (
+        (60, "φ6 四刃铣刀（涂层）"),
+        (480, "20"),
+        (600, "68.00"),
+        (740, "1360.00"),
+    ):
+        draw.text((x, 380), text, font=f18, fill=(30, 30, 30))
+    draw.line([60, 418, width - 60, 418], fill=(200, 200, 200), width=1)
+    draw.text((60, 438), "价税合计（大写）壹仟叁佰陆拾元整", font=f18, fill=(30, 30, 30))
+    draw.text((680, 438), "¥1360.00", font=_font(24), fill=(170, 30, 30))
+
+    # 一枚红色椭圆章，让这张图一眼能认成发票
+    draw.ellipse([640, 458, 860, 572], outline=(200, 40, 40), width=3)
+    draw.text((702, 505), "发票专用章", font=_font(16), fill=(200, 40, 40))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _seed_costs(db) -> None:
+    """两条测试成本：一条带样例发票图，一条「已开票但没图」。
+
+    第二条是故意留的：审核员点「只看缺票」时得有东西可看，
+    否则后补这个流程在演示里根本走不通。
+    """
+    sample = None
+    try:
+        sample = _sample_invoice_png()
+    except Exception as e:  # 字体缺失/绘制异常都不该让整个种子失败
+        print(f"  样例发票生成失败（不影响其它数据）: {e}")
+
+    for index, (category, spec, qty, price, supplier, invoiced, remark, days) in enumerate(
+        COSTS
+    ):
+        record = CostRecord(
+            category=category,
+            spec=spec,
+            quantity=qty,
+            unit_price=price,
+            supplier=supplier,
+            invoiced=invoiced,
+            remark=remark,
+            purchase_date=TODAY - timedelta(days=days),
+        )
+        db.add(record)
+        db.flush()  # 拿自增 id 才能挂发票
+
+        if index == 0 and sample:
+            try:
+                meta = save_invoice_image(sample, "样例发票.png")
+                db.add(
+                    CostInvoice(
+                        cost_id=record.id,
+                        file_path=meta["file_path"],
+                        filename=meta["filename"],
+                        size=meta["size"],
+                        content_type=meta["content_type"],
+                        source="web",
+                        uploaded_by="web",
+                    )
+                )
+            except Exception as e:
+                print(f"  样例发票落盘失败（不影响其它数据）: {e}")
+
+
 def seed() -> None:
     db = SessionLocal()
     try:
@@ -489,6 +623,7 @@ def seed() -> None:
         _seed_quotes(db)
         _seed_programmers(db)
         _seed_materials(db, orders)
+        _seed_costs(db)
         db.commit()
 
         print("演示数据已写入（is_test=1）：")
@@ -497,6 +632,7 @@ def seed() -> None:
         print(f"  订单 {len(orders)} 张（阶段 0–7 全覆盖，其中 3 张待接单）")
         print(f"  合同 {len(CONTRACTS)} 份（正常/暂停/取消/结案各一）")
         print(f"  报价单 {len(QUOTES)} 张、完工开工单 2 张、质检批次 6 条、异常单 3 张")
+        print(f"  成本 {len(COSTS)} 笔（其中 1 笔带样例发票、1 笔已开票待补图）")
     finally:
         db.close()
 

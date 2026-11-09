@@ -59,8 +59,8 @@ else
     ok "代码已更新: ${PREV_COMMIT:0:8} → ${NEW_COMMIT:0:8}"
 fi
 
-#----------- 2. 备份数据库 -----------#
-info "2/6 备份数据库..."
+#----------- 2. 备份数据库 + 上传文件 -----------#
+info "2/6 备份数据库与上传文件..."
 BACKUP_DIR="$APP_DIR/backups"
 mkdir -p "$BACKUP_DIR"
 BACKUP_FILE="$BACKUP_DIR/db_$(date +%Y%m%d_%H%M%S).sql"
@@ -74,8 +74,25 @@ if $COMPOSE ps db 2>/dev/null | grep -q "Up"; then
 else
     warn "数据库容器未运行，跳过备份"
 fi
-# 只保留最近 10 个备份
+
+# 发票图片不在库里：只备份 sql 会出现「库恢复了、发票全没了」这种最难解释的故障。
+# 图和库分开存、分开备，但要一起留、一起恢复。
+UPLOAD_SRC="$APP_DIR/uploads"
+if [ -d "$UPLOAD_SRC" ] && [ -n "$(ls -A "$UPLOAD_SRC" 2>/dev/null)" ]; then
+    UPLOAD_FILE="$BACKUP_DIR/uploads_$(date +%Y%m%d_%H%M%S).tar.gz"
+    if tar czf "$UPLOAD_FILE" -C "$APP_DIR" uploads 2>/dev/null; then
+        ok "上传文件已备份: $(basename "$UPLOAD_FILE") ($(du -h "$UPLOAD_FILE" | cut -f1))"
+    else
+        warn "上传文件备份失败，继续..."
+        rm -f "$UPLOAD_FILE"
+    fi
+else
+    info "还没有上传文件，跳过"
+fi
+
+# 各保留最近 10 份
 ls -t "$BACKUP_DIR"/db_*.sql 2>/dev/null | tail -n +11 | xargs -r rm -f
+ls -t "$BACKUP_DIR"/uploads_*.tar.gz 2>/dev/null | tail -n +11 | xargs -r rm -f
 
 #----------- 3. 构建镜像 -----------#
 info "3/6 构建镜像..."

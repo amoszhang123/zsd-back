@@ -27,6 +27,11 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # 发票图片落在宿主机 ./uploads（= /opt/zsd-back/uploads）。
+    # 用 bind mount 而不是命名卷：出问题时能直接 ls/tar，备份脚本也只要 tar 一个目录。
+    # 容器每次 deploy 都会重建，不挂出来的话图会跟着镜像一起没。
+    volumes:
+      - ./uploads:/app/uploads
     ports:
       - "8000:8000"
     networks:

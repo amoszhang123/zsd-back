@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     db_password: str = ""
     db_name: str = "factory_erp"
 
+    # 上传文件（目前只有成本发票图）的落盘根目录。
+    # 容器里是 /app/uploads，compose 把宿主机 /opt/zsd-back/uploads 挂上去 ——
+    # 容器重建不影响文件，但**备份脚本必须一起备份这个目录**，否则库恢复了图没了。
+    # 相对路径按「项目根目录」解析（不是 cwd），本机从任何目录启动都指向同一处。
+    upload_dir: str = "uploads"
+
     wx_appid: str = ""
     wx_app_secret: str = ""
     mp_mock_phone: str = ""

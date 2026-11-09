@@ -3,9 +3,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.database import init_db
+from app.invoice_storage import ensure_root
 from app.routers import (
     health, dashboard, orders, contracts, quotes, shipments, production,
     employees, auth, mp, quality, costs, materials, machines, bank, permissions,
@@ -70,6 +72,18 @@ app.include_router(materials.router)
 app.include_router(machines.router)
 app.include_router(bank.router)
 app.include_router(permissions.router)
+
+# 发票图片：直接按 /api/uploads/invoices/2026/11/<uuid>.jpg 直出。
+# 挂在 /api 前缀下是为了复用现有反代（线上 /api 已经指向本服务），
+# 不用再给 /uploads 单独加一条 nginx 规则 —— 少一条规则就少一处线上配不对的可能。
+#
+# 不做鉴权是刻意的：/api/costs 本身至今就是公开的（匿名就能读到全部金额），
+# 单给图片加 token 属于自欺欺人。真要收口应该整块给 costs 加登录态，另排期。
+app.mount(
+    "/api/uploads",
+    StaticFiles(directory=str(ensure_root())),
+    name="uploads",
+)
 
 
 if __name__ == "__main__":

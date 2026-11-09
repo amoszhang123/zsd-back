@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import settings
 from app.database import get_db, scoped
 from app.models.contract import blocked_orders
+from app.models.cost import CostInvoice
 from app.models.order import (
     PROGRAM_STEP,
     STEP_LABELS,
@@ -70,6 +71,13 @@ from app.routers.contracts import (
     update_contract_item_quantity,
     update_contract_status,
 )
+from app.routers.costs import (
+    attach_invoice,
+    get_cost_or_404,
+    list_cost_records,
+    record_out,
+    remove_invoice,
+)
 from app.routers.orders import (
     batch_confirm,
     confirm_order,
@@ -94,6 +102,7 @@ from app.schemas.contract import (
     ContractStatusUpdate,
     ContractSummary,
 )
+from app.schemas.cost import CostInvoiceOut, CostRecordOut
 from app.schemas.order import (
     BatchConfirmRequest,
     BatchConfirmResponse,
@@ -2054,18 +2063,18 @@ def save_program_time(
 # ------------------------------------------------- 报价管理（仅管理员岗位）
 
 
-def _require_admin(user, db: Session) -> Employee:
+def _require_admin(user, db: Session, feature: str = "报价管理") -> Employee:
     """取当前登录员工并确认是管理员。
 
-    报价单与合同全是商务数据（单价、总价、甲方、银行账户、税号），
+    报价单、合同、成本全是商务/财务数据（单价、总价、甲方、银行账户、税号、支出），
     车间员工一律 403。业务逻辑不重写，各端点直接委托 web 端那套实现，
-    这里只负责把门。
+    这里只负责把门。feature 只用于把报错文案说对，别让人以为是权限配错了。
     """
     emp = _current_employee(user, db)
     if emp.position != POSITION_ADMIN:
         raise HTTPException(
             403,
-            f"只有「{POSITION_ADMIN}」岗位可以访问报价管理，"
+            f"只有「{POSITION_ADMIN}」岗位可以访问{feature}，"
             f"你当前岗位是「{emp.position}」",
         )
     return emp
@@ -2327,3 +2336,55 @@ def submit_my_judgment(
         created_docs=result.created_docs,
         detail=_order_detail(db, order, emp),
     )
+
+
+# ---------------- 成本管理（仅管理员：只看 + 补发票） ----------------
+# 小程序端刻意不做新增/编辑/删除，也不做纳入库存/撤销入库：
+# 手机上录 8 个字段再选物料入库，误操作代价太高，而成本是财务数据。
+# 现场真正需要的是「拍张发票补上去」，这件事只有手机做得最快。
+
+
+@router.get("/costs", response_model=list[CostRecordOut])
+def mp_list_costs(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    """全部成本记录，筛选/统计交给前端 —— 与 web 端同一个 list_cost_records。
+
+    返回里带 invoices 和 invoice_missing，前端不用自己去算「哪几笔缺票」。
+    """
+    _require_admin(user, db, "成本管理")
+    return list_cost_records(db)
+
+
+@router.post("/costs/{cost_id}/invoices", response_model=CostRecordOut)
+async def mp_upload_cost_invoice(
+    cost_id: int,
+    file: UploadFile = File(...),
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    """补一张发票。校验、落盘、置「已开票」全走 costs.attach_invoice，与 web 同一条路径。"""
+    emp = _require_admin(user, db, "成本管理")
+    record = get_cost_or_404(db, cost_id)
+    attach_invoice(
+        db,
+        record,
+        await file.read(),
+        file.filename or "",
+        source="mp",
+        uploaded_by=f"{emp.id} {emp.name}".strip(),
+    )
+    return record_out(db, record)
+
+
+@router.delete("/costs/invoices/{invoice_id}")
+def mp_delete_cost_invoice(
+    invoice_id: int,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    """删一张传错的发票。查询走 ORM，is_test 过滤自动生效，删不到别人数据域的票。"""
+    _require_admin(user, db, "成本管理")
+    invoice = db.query(CostInvoice).filter(CostInvoice.id == invoice_id).first()
+    if not invoice:
+        raise HTTPException(404, f"发票不存在: #{invoice_id}")
+    remove_invoice(db, invoice)
+    return {"deleted": invoice_id}

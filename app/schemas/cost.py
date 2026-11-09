@@ -58,6 +58,19 @@ class CostRecordUpdate(BaseModel):
         return None if v is None else v.strip()
 
 
+class CostInvoiceOut(BaseModel):
+    """一张发票图。url 直接给前端当 <img src>，同源、不用再拼前缀。"""
+
+    id: int
+    filename: str = ""
+    size: int = 0
+    content_type: str = ""
+    url: str = ""
+    source: str = ""
+    uploaded_by: str = ""
+    created_at: datetime
+
+
 class CostRecordOut(BaseModel):
     id: int
     category: str
@@ -75,5 +88,9 @@ class CostRecordOut(BaseModel):
     material_name: str = ""
     stocked_qty: float | None = None
     stocked_at: datetime | None = None
+    # 发票图（0~9 张）。invoice_missing 由后端算好，前端不用重复判断：
+    # 「已开票」但没有一张图 = 纸质票还没拍，正是「后补」要找的那批。
+    invoices: list[CostInvoiceOut] = []
+    invoice_missing: bool = False
     created_at: datetime
     updated_at: datetime
