@@ -55,6 +55,7 @@ from app.models.quality import (
     ScrapOrder,
 )
 from app.models.quote import Quote, QuoteItem
+from app.work_order_code import format_code
 
 # 测试账号本人。手机号与后端 .env 的 MP_SMS_TEST_PHONE 必须一致。
 TEST_ACCOUNT_ID = "999999"
@@ -330,10 +331,13 @@ def _seed_work_orders(db, orders: dict[str, Order], machines: dict[str, Machine]
         ),
     ]
     for work_date, employee_ids, items in batches:
+        started = datetime.combine(work_date, datetime.min.time()) + timedelta(hours=8)
         wo = WorkOrder(
             work_date=work_date,
+            # 工单号跟 created_at 对齐，和线上建单的口径一致（14 位开单时间戳）
+            code=format_code(started),
             status="完工",
-            created_at=datetime.combine(work_date, datetime.min.time()) + timedelta(hours=8),
+            created_at=started,
             completed_at=datetime.combine(work_date, datetime.min.time()) + timedelta(hours=17),
         )
         wo.employees = [

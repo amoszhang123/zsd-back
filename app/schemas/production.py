@@ -28,6 +28,8 @@ class WorkOrderItemOut(BaseModel):
 
 class WorkOrderResponse(BaseModel):
     id: int
+    # 工单号：14 位开单时间戳（如 20261110151301）。界面显示这个，id 只做路由/外键
+    code: str = ""
     work_date: date
     status: str = "开工"
     employees: list[WorkOrderEmployeeOut] = []

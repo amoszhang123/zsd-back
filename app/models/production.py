@@ -67,6 +67,11 @@ class WorkOrder(TenantScoped, Base):
     __tablename__ = "work_orders"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 工单号：14 位「开单日期时间戳」，如 20261110151301 = 2026-11-10 15:13:01。
+    # 建单时由 app/work_order_code.py 生成并落库，历史行由启动时的回填补齐。
+    # 界面上一律显示它；id 只对内（URL 参数、外键），因为自增 id 会断号，当单号用不了。
+    # 长度留 20 是给「同秒 +n 秒」和以后可能的前缀留余量。
+    code: Mapped[str] = mapped_column(String(20), default="")
     work_date: Mapped[date] = mapped_column(Date, index=True)
     status: Mapped[str] = mapped_column(String(10), default="开工", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

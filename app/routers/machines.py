@@ -239,6 +239,7 @@ def machine_history(
     return [
         MachineHistoryItem(
             work_order_id=wo.id,
+            work_order_code=wo.code,
             work_date=wo.work_date,
             status=wo.status,
             order_id=item.order_id,

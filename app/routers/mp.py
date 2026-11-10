@@ -123,6 +123,7 @@ from app.schemas.quote import (
     QuoteItemUpdate,
     QuoteSummary,
 )
+from app.work_order_code import next_code
 
 router = APIRouter(prefix="/api/mp", tags=["mp"])
 
@@ -687,6 +688,8 @@ class MpWorkOrderOut(BaseModel):
     """列表项：工单号 + 开工时间 + 完工时间。"""
 
     id: int
+    # 工单号：14 位开单时间戳。界面只显示它，id 仅用于详情页路由参数
+    code: str = ""
     work_date: date
     status: str
     created_at: datetime
@@ -703,6 +706,8 @@ class MpWorkOrderListOut(BaseModel):
     # 由后端算好给前端，免得前端自己判断跟建单校验对不上。
     can_start: bool = True
     open_work_order_id: int | None = None
+    # 未完工那张单的工单号，前端提示「你还有未完工的工单 2026…」时直接用
+    open_work_order_code: str = ""
     # 前端是否显示「全厂 / 我的」切换。管理员与演示账号为 True，
     # 由后端下发而不是前端按岗位猜，避免两边口径漂移
     can_view_all: bool = False
@@ -736,6 +741,8 @@ class MpWorkOrderItemOut(BaseModel):
 
 class MpWorkOrderDetailOut(BaseModel):
     id: int
+    # 工单号：14 位开单时间戳，详情页标题显示它
+    code: str = ""
     work_date: date
     status: str
     created_at: datetime
@@ -793,6 +800,8 @@ class MpMachineBindRequest(BaseModel):
 
 class MpMachineBindOut(BaseModel):
     work_order_id: int
+    # 14 位工单号，前端提示「已新建工单 2026…」用；work_order_id 只做路由参数
+    work_order_code: str = ""
     work_order_is_new: bool = False
     order_id: str
     machine_id: str
@@ -819,12 +828,21 @@ def _current_employee(user, db: Session) -> Employee:
     return emp
 
 
+def _wo_label(work_order: WorkOrder) -> str:
+    """文案里对外的开工单标识：优先 14 位工单号，空号的历史单退回 #id。
+
+    界面和提示一律用它，别再手拼 ``#{id}`` —— 自增 id 会断号（本地库就有
+    1/2/20/37 这种），当单号用会让人对不上。
+    """
+    return work_order.code or f"#{work_order.id}"
+
+
 def _owned_work_order(db: Session, work_order_id: int, employee_id: str) -> WorkOrder:
     work_order = db.query(WorkOrder).filter(WorkOrder.id == work_order_id).first()
     if not work_order:
-        raise HTTPException(404, f"开工单不存在: #{work_order_id}")
+        raise HTTPException(404, f"工单不存在: #{work_order_id}")
     if employee_id not in [link.employee_id for link in work_order.employees]:
-        raise HTTPException(403, f"开工单 #{work_order_id} 不在你名下，无权操作")
+        raise HTTPException(403, f"工单 {_wo_label(work_order)} 不在你名下，无权操作")
     return work_order
 
 
@@ -850,7 +868,7 @@ def _new_work_order(
     建单」，建单和加第一行是同一个动作，分两步会留下一个可观测的空单窗口。
     """
     today = date.today()
-    work_order = WorkOrder(work_date=today)
+    work_order = WorkOrder(work_date=today, code=next_code(db))
     work_order.employees = [WorkOrderEmployee(employee_id=emp.id, work_date=today)]
     if order_id:
         work_order.items = [WorkOrderItem(order_id=order_id, machine_id=machine_id)]
@@ -885,9 +903,9 @@ def _work_order_add_error(db: Session, work_order: WorkOrder, order: Order) -> s
     /work-orders/{id}/scan 与 /quick-scan 共用这一份，加单规则不允许有两套。
     """
     if work_order.status == WORK_ORDER_STATUS_DONE:
-        return f"开工单 #{work_order.id} 已完工，不能再添加订单"
+        return f"工单 {_wo_label(work_order)} 已完工，不能再添加订单"
     if any(item.order_id == order.id for item in work_order.items):
-        return f"订单 {order.id} 已在本张开工单里，不用重复扫"
+        return f"订单 {order.id} 已在本张工单里，不用重复扫"
     return _order_add_error(db, order)
 
 
@@ -988,6 +1006,7 @@ def _work_order_detail(
     actionable = work_order.status != WORK_ORDER_STATUS_DONE and not readonly
     return MpWorkOrderDetailOut(
         id=work_order.id,
+        code=work_order.code,
         work_date=work_order.work_date,
         status=work_order.status,
         created_at=work_order.created_at,
@@ -1063,6 +1082,7 @@ def _work_order_rows(
     return [
         MpWorkOrderOut(
             id=w.id,
+            code=w.code,
             work_date=w.work_date,
             status=w.status,
             created_at=w.created_at,
@@ -1129,6 +1149,7 @@ def list_my_work_orders(
         work_orders=_work_order_rows(work_orders, mine_ids),
         can_start=open_wo is None,
         open_work_order_id=open_wo.id if open_wo else None,
+        open_work_order_code=(open_wo.code if open_wo else ""),
         can_view_all=can_view_all,
         scope=scope,
     )
@@ -1136,7 +1157,7 @@ def list_my_work_orders(
 
 @router.post("/work-orders", response_model=MpWorkOrderDetailOut)
 def create_my_work_order(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
-    """开工：先建一张**空**开工单，订单随后在机台边扫图纸二维码逐个加进来。
+    """开工：先建一张**空**工单，订单随后在机台边扫图纸二维码逐个加进来。
 
     与 web 端 start_work 的差别就在这：web 是先选好订单再开工，所以要求 order_ids
     非空；小程序开工时还没确定做哪几张，故建单不校验订单，订单的阶段/合同校验
@@ -1148,7 +1169,7 @@ def create_my_work_order(user=Depends(_get_mp_user), db: Session = Depends(get_d
     if open_wo:
         raise HTTPException(
             400,
-            f"你还有未完工的开工单 #{open_wo.id}（{open_wo.work_date}），必须先完工结单",
+            f"你还有未完工的工单 {_wo_label(open_wo)}（{open_wo.work_date}），必须先完工结单",
         )
 
     return _work_order_detail(db, _new_work_order(db, emp))
@@ -1158,7 +1179,7 @@ def create_my_work_order(user=Depends(_get_mp_user), db: Session = Depends(get_d
 def get_my_work_order(
     work_order_id: int, user=Depends(_get_mp_user), db: Session = Depends(get_db)
 ):
-    """开工单详情。
+    """工单详情。
 
     含本人 → 可操作（加单 / 完工）；不含本人且是管理员 → 只读查看（全厂视图里
     点进去看别人的单）。普通岗位看别人的单仍然 403，口径与 _owned_work_order 一致。
@@ -1166,13 +1187,13 @@ def get_my_work_order(
     emp = _current_employee(user, db)
     work_order = db.query(WorkOrder).filter(WorkOrder.id == work_order_id).first()
     if not work_order:
-        raise HTTPException(404, f"开工单不存在: #{work_order_id}")
+        raise HTTPException(404, f"工单不存在: #{work_order_id}")
     if emp.id in [link.employee_id for link in work_order.employees]:
         return _work_order_detail(db, work_order)
     if emp.position == POSITION_ADMIN or emp.is_test:
-        # 管理员 / 演示账号可只读查看任意开工单，动作开关由 readonly 关掉
+        # 管理员 / 演示账号可只读查看任意工单，动作开关由 readonly 关掉
         return _work_order_detail(db, work_order, readonly=True)
-    raise HTTPException(403, f"开工单 #{work_order_id} 不在你名下，无权操作")
+    raise HTTPException(403, f"工单 {_wo_label(work_order)} 不在你名下，无权操作")
 
 
 @router.post("/work-orders/{work_order_id}/scan", response_model=MpWorkOrderDetailOut)
@@ -1256,7 +1277,7 @@ def quick_scan(req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Dep
                 out.work_order_is_new = is_new
                 out.action = "work_order_added"
                 out.message = (
-                    f"订单 {order.id} 已加入{'新建的' if is_new else ''}开工单 #{work_order.id}"
+                    f"订单 {order.id} 已加入{'新建的' if is_new else ''}工单 {_wo_label(work_order)}"
                 )
                 return out
             # 已经在别的开工单里之类：不新增，但也没必要拦着看详情
@@ -1288,7 +1309,7 @@ def quick_scan(req: MpScanRequest, user=Depends(_get_mp_user), db: Session = Dep
         db.add(WorkOrderItem(work_order_id=work_order.id, order_id=order.id))
         db.commit()
         out.action = "work_order_added"
-        out.message = f"订单 {order.id} 已加入{'新建的' if is_new else ''}开工单 #{work_order.id}"
+        out.message = f"订单 {order.id} 已加入{'新建的' if is_new else ''}工单 {_wo_label(work_order)}"
         return out
 
     if emp.position == POSITION_PROGRAMMER:
@@ -1432,9 +1453,10 @@ def machine_bind(
         db.commit()
         return MpMachineBindOut(
             work_order_id=open_wo.id,
+            work_order_code=_wo_label(open_wo),
             order_id=order.id,
             machine_id=machine.id,
-            message=f"订单 {order.id} 已加入开工单 #{open_wo.id}，机台 {machine.id}",
+            message=f"订单 {order.id} 已加入工单 {_wo_label(open_wo)}，机台 {machine.id}",
         )
 
     # 没有未完工单：先把订单本身的开工条件校验完再建单，避免留下空单
@@ -1444,10 +1466,11 @@ def machine_bind(
     work_order = _new_work_order(db, emp, order_id=order.id, machine_id=machine.id)
     return MpMachineBindOut(
         work_order_id=work_order.id,
+        work_order_code=_wo_label(work_order),
         work_order_is_new=True,
         order_id=order.id,
         machine_id=machine.id,
-        message=f"已新建开工单 #{work_order.id}，订单 {order.id} 关联机台 {machine.id}",
+        message=f"已新建工单 {_wo_label(work_order)}，订单 {order.id} 关联机台 {machine.id}",
     )
 
 

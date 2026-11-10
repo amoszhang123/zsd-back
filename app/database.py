@@ -122,6 +122,29 @@ def init_db():
 
     ensure_schema()
 
+    # 工单号（work_orders.code，14 位开单时间戳）是后加的列：ensure_schema 只能把它
+    # 补成空串，历史单还得在这里补齐，否则旧单在界面上会显示成空工单号。
+    # 幂等：只处理 code 为空的行，补过的不会再动，多 worker 同时启动也不会互相踩。
+    # 失败不阻断启动 —— 少一个工单号的服务，总比起不来的服务好。
+    try:
+        from app.work_order_code import backfill_codes
+
+        filled = backfill_codes()
+        if filled["filled"]:
+            import logging
+
+            logging.getLogger(__name__).info(
+                "开工单号回填完成：%s 张（共 %s 张空号）",
+                filled["filled"],
+                filled["total"],
+            )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "开工单号回填失败，可手动重跑：python -m app.work_order_code"
+        )
+
 
 def _column_ddl(table: str, col) -> str:
     """把模型上的一列渲染成 MySQL 的 ADD COLUMN 语句。

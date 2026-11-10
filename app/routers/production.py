@@ -17,6 +17,7 @@ from app.models.production import (
     WorkOrderItem,
 )
 from app.routers.quality import advance_order_to
+from app.work_order_code import next_code
 from app.schemas.production import (
     CompleteWorkRequest,
     CompleteWorkResponse,
@@ -52,6 +53,7 @@ def _to_work_order_response(work_order: WorkOrder) -> WorkOrderResponse:
 
     return WorkOrderResponse(
         id=work_order.id,
+        code=work_order.code,
         work_date=work_order.work_date,
         status=work_order.status,
         employees=[
@@ -221,7 +223,9 @@ def start_work(req: StartWorkRequest, db: Session = Depends(get_db)):
     # 一天能开几张不限（原先的「一人一天一张」已放开，DB 唯一约束也一并删了，
     # 见 migrations/20261008_drop_employee_work_date_unique.sql）。
     open_rows = (
-        db.query(WorkOrderEmployee.employee_id, WorkOrder.id, WorkOrder.work_date)
+        db.query(
+            WorkOrderEmployee.employee_id, WorkOrder.id, WorkOrder.code, WorkOrder.work_date
+        )
         .join(WorkOrder, WorkOrder.id == WorkOrderEmployee.work_order_id)
         .filter(
             WorkOrderEmployee.employee_id.in_(employee_ids),
@@ -232,12 +236,12 @@ def start_work(req: StartWorkRequest, db: Session = Depends(get_db)):
     if open_rows:
         emp_name = {e.id: e.name for e in employees}
         detail = "、".join(
-            f"{emp_name.get(eid, eid)}({eid}) 开工单 #{wid}（{wd}）"
-            for eid, wid, wd in open_rows
+            f"{emp_name.get(eid, eid)}({eid}) 开工单 {code or f'#{wid}'}（{wd}）"
+            for eid, wid, code, wd in open_rows
         )
         raise HTTPException(400, f"以下员工还有未完工的开工单，必须先完工结单: {detail}")
 
-    work_order = WorkOrder(work_date=today)
+    work_order = WorkOrder(work_date=today, code=next_code(db))
     work_order.employees = [
         WorkOrderEmployee(employee_id=eid, work_date=today) for eid in employee_ids
     ]
@@ -250,7 +254,7 @@ def start_work(req: StartWorkRequest, db: Session = Depends(get_db)):
     db.refresh(work_order)
     return StartWorkResponse(
         success=True,
-        message=f"开工成功：开工单 #{work_order.id}，{len(employee_ids)} 名员工 / {len(order_ids)} 个订单",
+        message=f"开工成功：开工单 {work_order.code}，{len(employee_ids)} 名员工 / {len(order_ids)} 个订单",
         work_order=_to_work_order_response(work_order),
     )
 

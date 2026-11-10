@@ -48,6 +48,8 @@ class MachineHistoryItem(BaseModel):
     """这台机台干过的一行活：某张开工单里的某个订单。"""
 
     work_order_id: int
+    # 工单号：14 位开单时间戳。界面显示它，work_order_id 只做路由/关联
+    work_order_code: str = ""
     work_date: date
     status: str
     order_id: str
