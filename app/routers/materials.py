@@ -176,6 +176,7 @@ def _material_out(m: Material, pending: dict[int, Decimal]) -> MaterialOut:
         id=m.id, code=m.code, name=m.name, spec=m.spec, unit=m.unit,
         category=m.category, location=m.location,
         warn_threshold=_f(threshold), active=bool(m.active),
+        must_return=bool(m.must_return),
         stock_qty=_f(stock), issued_qty=_f(m.issued_qty), scrapped_qty=_f(m.scrapped_qty),
         total_in=_f(stock + _d(m.issued_qty) + _d(m.scrapped_qty)),
         pending_qty=_f(pending.get(m.id, ZERO)),
@@ -234,7 +235,7 @@ def create_material(req: MaterialCreate, db: Session = Depends(get_db)):
         code=_next_material_code(db),
         name=req.name, spec=req.spec, unit=req.unit, category=req.category,
         location=req.location, warn_threshold=_d(req.warn_threshold),
-        remark=req.remark, active=True,
+        remark=req.remark, active=True, must_return=req.must_return,
         stock_qty=ZERO, issued_qty=ZERO, scrapped_qty=ZERO,
     )
     for attempt in range(3):
@@ -367,6 +368,45 @@ def _issue_items_out(db: Session, orders: list[IssueOrder]) -> dict[int, list[Is
     return out
 
 
+def _unsettled_for(
+    db: Session, employee_id: str, material_ids: list[int]
+) -> dict[int, tuple[Decimal, list[str]]]:
+    """这个人名下这些物料还有多少没结清，以及欠在哪几张单上。
+
+    只认「未结清 > 0」的行：单据状态是 open、且 qty − 已还 − 已废 还没归零。
+    归还和报废都能把一行清掉（报废由仓管在 web 端操作），所以这里只看余量，
+    不区分是还清的还是废清的 —— 「必须归还」约束的是「上次那笔结了没有」，
+    不是「必须原物交回」。
+    """
+    if not material_ids:
+        return {}
+    rows = (
+        db.query(
+            IssueItem.material_id,
+            IssueOrder.order_no,
+            IssueItem.qty,
+            IssueItem.returned_qty,
+            IssueItem.scrapped_qty,
+        )
+        .join(IssueOrder, IssueOrder.id == IssueItem.issue_order_id)
+        .filter(
+            IssueOrder.employee_id == employee_id,
+            IssueOrder.status == ISSUE_OPEN,
+            IssueItem.material_id.in_(material_ids),
+        )
+        .order_by(IssueOrder.issued_at.desc())
+        .all()
+    )
+    out: dict[int, tuple[Decimal, list[str]]] = {}
+    for mid, order_no, qty, returned, scrapped in rows:
+        open_qty = _d(qty) - _d(returned) - _d(scrapped)
+        if open_qty <= ZERO:
+            continue
+        total, nos = out.get(mid, (ZERO, []))
+        out[mid] = (total + open_qty, nos + ([order_no] if order_no not in nos else []))
+    return out
+
+
 def _issue_out(o: IssueOrder, items: list[IssueItemOut]) -> IssueOrderOut:
     return IssueOrderOut(
         id=o.id, order_no=o.order_no, employee_id=o.employee_id,
@@ -405,6 +445,23 @@ def create_issue(req: IssueCreate, db: Session = Depends(get_db)):
                 f"本次要领 {_f(qty)}{m.unit}",
             )
         materials[material_id] = m
+
+    # 「必须归还」拦在最后、建单之前：库存不够、已停用这些更硬的错先报出来，
+    # 否则员工以为还了就能领，还完发现还是没货。
+    guarded = [m for m in materials.values() if m.must_return]
+    if guarded:
+        unsettled = _unsettled_for(db, employee.id, [m.id for m in guarded])
+        problems = [
+            f"「{materials[mid].name}」还欠 {_f(qty)}{materials[mid].unit}"
+            f"（{('、'.join(nos[:2]))}{'…' if len(nos) > 2 else ''}）"
+            for mid, (qty, nos) in unsettled.items()
+        ]
+        if problems:
+            raise HTTPException(
+                400,
+                f"{employee.name} 上次领的还没结清：{'；'.join(problems)}。"
+                "请先归还（料已损毁的由仓管在物料管理里报废）后再领。",
+            )
 
     names = [materials[mid].name for mid in merged]
     summary = "、".join(names)

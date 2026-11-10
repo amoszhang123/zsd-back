@@ -11,6 +11,7 @@ from app.invoice_storage import ensure_root
 from app.routers import (
     health, dashboard, orders, contracts, quotes, shipments, production,
     employees, auth, mp, quality, costs, materials, machines, bank, permissions,
+    mp_materials,
 )
 
 
@@ -67,6 +68,9 @@ app.include_router(quality.router)
 app.include_router(employees.router)
 app.include_router(auth.router)
 app.include_router(mp.router)
+# 小程序的物料领取接口（员工视角）。必须排在后端 mp 之后注册：
+# 它 import 了 mp 里的 _get_mp_user / _current_employee，顺序反过来会循环导入。
+app.include_router(mp_materials.router)
 app.include_router(costs.router)
 app.include_router(materials.router)
 app.include_router(machines.router)

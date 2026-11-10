@@ -72,6 +72,10 @@ class Material(Base):
     # 库存 < 阈值 即告警；0 表示不告警（关闭）
     warn_threshold: Mapped[Decimal] = mapped_column(QTY, default=Decimal("0"))
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    # 必须归还：勾了之后，同一个人领这一样料之前，必须先把上次领的结清
+    # （归还或报废都算结清，见 routers/materials.py 的 _unsettled_for）。
+    # 只约束「能不能再领」，不改变任何记账口径。
+    must_return: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
     stock_qty: Mapped[Decimal] = mapped_column(QTY, default=Decimal("0"))
     issued_qty: Mapped[Decimal] = mapped_column(QTY, default=Decimal("0"))

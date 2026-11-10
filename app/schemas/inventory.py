@@ -21,6 +21,8 @@ class MaterialCreate(BaseModel):
     location: str = Field(default="", max_length=50)
     # 库存 < 阈值 才告警，0 表示关闭告警
     warn_threshold: float = Field(default=0, ge=0)
+    # 必须归还：勾了之后，同一个人再次领这一样料前必须先把上次领的结清
+    must_return: bool = False
     remark: str = Field(default="", max_length=500)
 
     @field_validator("name")
@@ -54,6 +56,7 @@ class MaterialUpdate(BaseModel):
     category: str | None = Field(default=None, max_length=50)
     location: str | None = Field(default=None, max_length=50)
     warn_threshold: float | None = Field(default=None, ge=0)
+    must_return: bool | None = None
     remark: str | None = Field(default=None, max_length=500)
     active: bool | None = None
 
@@ -83,6 +86,8 @@ class MaterialOut(BaseModel):
     location: str = ""
     warn_threshold: float = 0
     active: bool = True
+    # 必须归还：领用前要先把这个人上次领的结清
+    must_return: bool = False
     stock_qty: float = 0
     issued_qty: float = 0
     scrapped_qty: float = 0
