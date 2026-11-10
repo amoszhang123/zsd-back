@@ -1689,12 +1689,17 @@ def _can_edit_program(order: Order) -> bool:
 
 
 def _require_programmer(emp: Employee) -> None:
+    """编程岗与管理员都能填程序时间。
+
+    管理员这一条是「我的订单」里待编程单开放给管理员后才需要的：
+    前端给了绿色「编辑」入口，后端还按岗位 403 的话，点进去就是白点。
+    """
     if emp.is_test:
         return
-    if emp.position != POSITION_PROGRAMMER:
+    if emp.position not in (POSITION_PROGRAMMER, POSITION_ADMIN):
         raise HTTPException(
             403,
-            f"只有「{POSITION_PROGRAMMER}」岗位可以填写程序时间，"
+            f"只有「{POSITION_PROGRAMMER}」或「{POSITION_ADMIN}」岗位可以填写程序时间，"
             f"你当前岗位是「{emp.position}」",
         )
 
@@ -1889,9 +1894,9 @@ def _order_detail(db: Session, order: Order, emp: Employee) -> MpOrderDetailOut:
         deadline=order.deadline,
         machining_minutes=order.machining_minutes,
         estimated_hours=order.estimated_hours,
-        # 绿色编辑按钮只给编程岗，否则质检员会看到一个点了就 403 的按钮
+        # 绿色编辑按钮只给编程岗与管理员，否则质检员会看到一个点了就 403 的按钮
         can_edit=_can_edit_program(order)
-        and (emp.position == POSITION_PROGRAMMER or emp.is_test),
+        and (emp.position in (POSITION_PROGRAMMER, POSITION_ADMIN) or emp.is_test),
         can_judge=is_qc and qc_pending_qty > 0,
         qc_stage=qc_stage,
         qc_stage_label=STAGE_LABELS.get(qc_stage, ""),
@@ -1924,13 +1929,19 @@ def _order_detail(db: Session, order: Order, emp: Employee) -> MpOrderDetailOut:
 def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
     """我涉及的订单，按岗位分口径：
 
-    管理员 = 全厂订单（与「接单管理」同范围）；编程岗 = 所有待编程 + 我编程过的；
+    管理员 = 全厂订单（与「接单管理」同范围），并带编程视角的状态标注，
+             这样「待编程」的单在手机上也能认出来、能直接进去填程序时间；
+    编程岗 = 所有待编程 + 我编程过的；
     质检岗 = 所有待质检 + 我质检过的；其它岗 = 我参与生产过的。
     """
     emp = _current_employee(user, db)
     # 测试账号是岗位并集：列表里每张单都同时带「待编程」「待质检」状态，
-    # 审核员不用换账号就能看到三条链路的入口
-    is_programmer = emp.position == POSITION_PROGRAMMER or emp.is_test
+    # 审核员不用换账号就能看到三条链路的入口。
+    # 管理员也算编程视角：他的范围本来就是全厂订单（_my_order_ids 里单独处理），
+    # 但不算编程视角的话，每张单都不会带 program_state，界面上就看不出哪张待编程。
+    is_programmer = (
+        emp.position in (POSITION_PROGRAMMER, POSITION_ADMIN) or emp.is_test
+    )
     is_qc = emp.position == POSITION_QC or emp.is_test
 
     # 待检映射算一次，_my_order_ids 和下面的行构造共用，别重复扫三张表
