@@ -24,7 +24,9 @@ from app.models.cost import CostInvoice
 from app.models.order import (
     ORDER_STATUS_IN_PRODUCTION,
     ORDER_STATUS_WAITING_PRODUCTION,
+    PRODUCTION_STEP,
     PROGRAM_STEP,
+    SHIPPING_STEP,
     STEP_LABELS,
     Order,
     hours_from_machining_minutes,
@@ -1556,17 +1558,18 @@ class MpMyOrderOut(BaseModel):
     # True → 显示绿色的「判定」按钮
     can_judge: bool = False
     programmers: list[str] = []
-    # 这一行属于哪几张统计卡（all / program_pending / program_done /
-    # qc_pending / qc_done / production）。前端点统计卡就按它筛，
-    # 判定口径只留在后端一处，别在前端用 status 字符串再猜一遍。
+    # 这一行属于哪几张统计卡（all / intake / program_pending /
+    # waiting_production / in_production / qc_pending / shipping）。
+    # 前端点统计卡就按它筛，判定口径只留在后端一处，别在前端用 status 再猜一遍。
     stat_keys: list[str] = []
 
 
 class MpMyOrderStatOut(BaseModel):
     """「我的订单」顶部的一张统计卡。key 是筛选依据，count 是这一类有几单。
 
-    给哪几张卡由岗位决定（编程岗看待编程/已编程、操作工看待生产/我参与、
-    管理员全给），前端只负责渲染 + 按 key 过滤，不再自己判断岗位。
+    卡片的集合与顺序按工序走：订单总数 → 待接单 → 待编程 → 待生产 →
+    生产中 → 待质检 → 待出货。给哪几张由岗位决定（管理员全给、编程只看
+    自己这条链、质检只看待质检），前端只负责渲染 + 按 key 过滤。
     """
 
     key: str
@@ -1580,11 +1583,24 @@ class MpMyOrderListOut(BaseModel):
     stats: list[MpMyOrderStatOut] = []
     is_programmer: bool = False
     is_qc: bool = False
+    # 下面几个计数是给工作台角标 / 兼容旧前端留的。新前端只用 stats，
+    # 「已编程」「已质检」两张卡已按工序口径去掉，done 类恒为 0。
     pending_count: int = 0
     programmed_count: int = 0
-    # 质检岗用这两个；编程岗看上面两个
     qc_pending_count: int = 0
     qc_done_count: int = 0
+
+
+class MpMyOrderBadgeOut(BaseModel):
+    """工作台「我的订单」入口的角标。
+
+    can_open 决定入口显不显示（操作工不开放），pending 是红色角标上的数字：
+    编程岗 = 待编程单数，质检岗 = 待质检单数，管理员与其他岗恒为 0。
+    """
+
+    can_open: bool = False
+    pending: int = 0
+    label: str = ""
 
 
 class MpQcStageOut(BaseModel):
@@ -1772,27 +1788,6 @@ def _qc_pending_by_order(db: Session) -> dict[str, tuple[str, int]]:
     return out
 
 
-def _my_inspected_order_ids(db: Session, employee_id: str) -> set[str]:
-    """我作为质检员检过的订单。按 inspector_id 查，不是 employee_id ——
-    后者存的是报废/返工的第一位负责人，跟谁做的质检没关系。"""
-    rows = (
-        db.query(QcInspection.order_id)
-        .filter(QcInspection.inspector_id == employee_id)
-        .distinct()
-        .all()
-    )
-    return {row[0] for row in rows}
-
-
-def _inspected_order_ids(db: Session) -> set[str]:
-    """全厂被质检过的订单（不区分是谁检的）。
-
-    只给管理员/测试账号的「已质检」卡用：他们的口径是全厂，用「我检过的」
-    会永远是 0 —— 管理员本来就不做判定（_require_qc 拦着）。
-    """
-    return {row[0] for row in db.query(QcInspection.order_id).distinct().all()}
-
-
 def _remember_programmer(db: Session, order_id: str, employee_id: str) -> None:
     """记下「这人编程过这张单」。(order_id, employee_id) 有唯一约束，重复保存不再插。"""
     exists = (
@@ -1824,15 +1819,74 @@ def _programmers_map(db: Session, order_ids: list[str]) -> dict[str, list[str]]:
     return out
 
 
+# 「我的订单」顶部统计卡：严格按工序顺序排（备料总开关关闭，没有备料卡）。
+# 第一个元素是筛选 key，第二个是卡片文案。给哪几张由岗位决定，见 my_orders。
+MY_ORDER_STATS = [
+    ("all", "订单总数"),
+    ("intake", "待接单"),
+    ("program_pending", "待编程"),
+    ("waiting_production", "待生产"),
+    ("in_production", "生产中"),
+    ("qc_pending", "待质检"),
+    ("shipping", "待出货"),
+]
+
+# 能进「我的订单」的三个岗位。操作工不在其中 —— 他看「我的工单」。
+MY_ORDER_POSITIONS = (POSITION_ADMIN, POSITION_PROGRAMMER, POSITION_QC)
+
+
+def _can_open_my_orders(emp: Employee) -> bool:
+    """「我的订单」是否对该岗位开放。
+
+    操作工一律不开放：他手上要看的是「我的工单」（开工单视角），订单维度的
+    排产进展属于编程 / 质检 / 管理层的活。前端据此隐藏入口，这里负责兜底。
+    """
+    return emp.is_test or emp.position in MY_ORDER_POSITIONS
+
+
+def _stat_keys_of(
+    order: Order,
+    step: int,
+    producing: set[str],
+    qc_pending: dict[str, tuple[str, int]],
+) -> list[str]:
+    """一张订单落在哪几张统计卡上。
+
+    工序口径（备料总开关关闭，一张单在生产链上只落一张卡）：
+      待接单 = step0；待编程 = step2 未填程序时间；待生产 = step2 已填（齐备）
+      或 step3 未开工；生产中 = step3 已开工；待出货 = step7。
+    「待生产」把「齐备」也算进来：程序填完就是在等开工，否则这些单只会出现在
+    「订单总数」里，点不出来。
+    「待质检」是叠加维度 —— 质检1 / 表处 / 质检2 任一阶段还有没检完的数量就挂上。
+    """
+    keys = ["all"]
+    if step == 0:
+        keys.append("intake")
+    elif step == PROGRAM_STEP:
+        keys.append(
+            "program_pending" if order.machining_minutes is None else "waiting_production"
+        )
+    elif step == PRODUCTION_STEP:
+        keys.append("in_production" if order.id in producing else "waiting_production")
+    elif step == SHIPPING_STEP:
+        keys.append("shipping")
+    if order.id in qc_pending:
+        keys.append("qc_pending")
+    return keys
+
+
 def _my_order_ids(
     db: Session, emp: Employee, qc_pending: dict[str, tuple[str, int]] | None = None
 ) -> list[str]:
-    """「我的订单」的取数口径，按岗位分四种。
+    """「我的订单」列表的取数口径，按岗位分三种。
 
     管理员：全厂订单，与「接单管理」同一数据范围。
-    编程岗：所有待编程的订单（还没人接的活，谁都能领）+ 我参与编程过的订单。
-    质检岗：所有待质检的订单 + 我质检过的订单。
-    其它岗：我参与生产过的订单（order_contributions 里有我的记录）。
+    编程岗：所有待编程的订单（还没人填程序时间，谁都能领）+ 我参与编程过、
+            但还没开工的订单（程序阶段已填 / 投产待生产）。一旦开工，
+            这张单就从他的列表里消失 —— 活已经交给车间了。
+    质检岗：只列待质检的订单（待检数量 > 0），检过的单不再占位置。
+
+    操作工不开放，调用方先用 _can_open_my_orders 拦掉，这里兜底抛 403。
     """
     if emp.position == POSITION_ADMIN or emp.is_test:
         # 测试账号按管理员口径看全厂：演示库里就十几张单，审核员要能一次看全
@@ -1849,39 +1903,86 @@ def _my_order_ids(
             )
             .all()
         ]
-        programmed = [
+        mine = [
             row[0]
             for row in db.query(OrderProgrammer.order_id)
             .filter(OrderProgrammer.employee_id == emp.id)
             .all()
         ]
-        # 两个集合可能重叠（我刚编程完、它还停在程序阶段），去重保序
-        return list(dict.fromkeys(pending + programmed))
+        candidates = list(dict.fromkeys(pending + mine))
+        if not candidates:
+            return []
+        mine_set = set(mine)
+        producing = in_production_order_ids(db, candidates)
+        rows = (
+            db.query(Order.id, Order.current_step)
+            .filter(Order.id.in_(candidates))
+            .all()
+        )
+        keep: list[str] = []
+        for order_id, step in rows:
+            if order_id in mine_set:
+                # 我编过的：只留还没开工的（程序阶段 / 待生产）
+                if step == PROGRAM_STEP or (
+                    step == PRODUCTION_STEP and order_id not in producing
+                ):
+                    keep.append(order_id)
+            elif step == PROGRAM_STEP:
+                # 还没人认领的待编程单，谁都能领
+                keep.append(order_id)
+        return keep
 
     if emp.position == POSITION_QC:
         # qc_pending 允许调用方传进来复用，列表接口已经算过一遍了，别再算第二次
         wait = qc_pending if qc_pending is not None else _qc_pending_by_order(db)
-        return list(dict.fromkeys(list(wait) + sorted(_my_inspected_order_ids(db, emp.id))))
+        return list(wait)
 
-    # 操作工：「我参与的」= 参与度里记过我的 + 我名下开工单里的单。
-    # 后者原先漏了 —— 参与度只在整单做完时写一次，开工中的单反而查不到，
-    # 于是「待生产」那张卡永远是 0，人也就没法从列表点进正在做的活。
-    contributed = [
-        row[0]
-        for row in db.query(OrderContribution.order_id)
-        .filter(OrderContribution.employee_id == emp.id)
-        .all()
-    ]
-    in_my_work_orders = [
-        row[0]
-        for row in db.query(WorkOrderItem.order_id)
-        .join(WorkOrder, WorkOrder.id == WorkOrderItem.work_order_id)
-        .join(WorkOrderEmployee, WorkOrderEmployee.work_order_id == WorkOrder.id)
-        .filter(WorkOrderEmployee.employee_id == emp.id)
-        .all()
-    ]
-    # 去重保序：先列做过的，再列手上正在做的
-    return list(dict.fromkeys(contributed + in_my_work_orders))
+    raise HTTPException(
+        403,
+        f"「我的订单」只对「{POSITION_ADMIN}」「{POSITION_PROGRAMMER}」"
+        f"「{POSITION_QC}」岗位开放，你当前岗位是「{emp.position}」。"
+        "车间开工请在「我的工单」里查看。",
+    )
+
+
+
+def _order_accessible(db: Session, order_id: str, emp: Employee) -> bool:
+    """这张订单该不该给他打开详情。
+
+    口径比列表宽一档：列表是「待办」，详情是「这条记录」。质检判完的单还要能
+    回看，编程编完、已经开工的单同理 —— 否则从扫码或聊天里点进来就 403，
+    人会以为系统坏了。
+    """
+    if emp.position == POSITION_ADMIN or emp.is_test:
+        return True
+    if emp.position == POSITION_PROGRAMMER:
+        pending = db.query(Order.id).filter(
+            Order.id == order_id,
+            Order.current_step == PROGRAM_STEP,
+            Order.machining_minutes.is_(None),
+        ).first()
+        if pending:
+            return True
+        return bool(
+            db.query(OrderProgrammer.order_id)
+            .filter(
+                OrderProgrammer.order_id == order_id,
+                OrderProgrammer.employee_id == emp.id,
+            )
+            .first()
+        )
+    if emp.position == POSITION_QC:
+        if (
+            db.query(QcInspection.id)
+            .filter(
+                QcInspection.order_id == order_id,
+                QcInspection.inspector_id == emp.id,
+            )
+            .first()
+        ):
+            return True
+        return order_id in _qc_pending_by_order(db)
+    return False
 
 
 def _visible_order(db: Session, order_id: str, emp: Employee) -> Order:
@@ -1889,14 +1990,10 @@ def _visible_order(db: Session, order_id: str, emp: Employee) -> Order:
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(404, f"订单不存在: {order_id}")
-    # 管理员的可见范围就是全厂，不必再把全量 id 拉出来做成员判断
-    if (
-        emp.position != POSITION_ADMIN
-        and not emp.is_test
-        and order_id not in _my_order_ids(db, emp)
-    ):
+    if not _order_accessible(db, order_id, emp):
         raise HTTPException(403, f"订单 {order_id} 不在你的「我的订单」范围内")
     return order
+
 
 
 def _order_detail(db: Session, order: Order, emp: Employee) -> MpOrderDetailOut:
@@ -1990,38 +2087,74 @@ def _order_detail(db: Session, order: Order, emp: Employee) -> MpOrderDetailOut:
     )
 
 
+@router.get("/my-orders/badge", response_model=MpMyOrderBadgeOut)
+def my_order_badge(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    """工作台「我的订单」入口：能不能进 + 有几单待处理（红色角标）。
+
+    只给编程（待编程）和质检（待质检）出数字 —— 管理员看的是全厂，没有"属于
+    他的待办"；操作工入口本来就不给。数量与列表接口同一口径（同一份合同过滤），
+    不会出现「角标 3、点进去 0 条」。
+    """
+    emp = _current_employee(user, db)
+    if not _can_open_my_orders(emp):
+        return MpMyOrderBadgeOut(can_open=False)
+    if emp.position == POSITION_ADMIN or emp.is_test:
+        return MpMyOrderBadgeOut(can_open=True)
+
+    if emp.position == POSITION_PROGRAMMER:
+        rows = (
+            db.query(Order)
+            .filter(
+                Order.current_step == PROGRAM_STEP,
+                Order.machining_minutes.is_(None),
+            )
+            .all()
+        )
+        blocked = blocked_orders(db, [o.id for o in rows])
+        return MpMyOrderBadgeOut(
+            can_open=True,
+            pending=sum(1 for o in rows if o.id not in blocked),
+            label=PROGRAM_STATE_PENDING,
+        )
+
+    # 剩下的就是质检岗（_can_open_my_orders 已经挡掉其他岗位）
+    wait = _qc_pending_by_order(db)
+    rows = db.query(Order.id).filter(Order.id.in_(list(wait))).all() if wait else []
+    blocked = blocked_orders(db, [row[0] for row in rows])
+    return MpMyOrderBadgeOut(
+        can_open=True,
+        pending=sum(1 for row in rows if row[0] not in blocked),
+        label=QC_STATE_PENDING,
+    )
+
+
 @router.get("/my-orders", response_model=MpMyOrderListOut)
 def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
-    """我涉及的订单，按岗位分口径：
+    """「我的订单」：按工序顺序给出各环节堆积了多少活。
 
-    管理员 = 全厂订单（与「接单管理」同范围），并带编程视角的状态标注，
-             这样「待编程」的单在手机上也能认出来、能直接进去填程序时间；
-    编程岗 = 所有待编程 + 我编程过的；
-    质检岗 = 所有待质检 + 我质检过的；
-    操作工 = 我参与过的 + 我名下开工单里的（开工中的单还没写参与度，得单独收）。
+    统计卡与列表共用**同一份口径**，点哪张卡就筛哪一类，不会出现「卡上有数、
+    列表空着」。可见范围按岗位收窄：
+
+      管理员 = 全厂订单，七张卡全给，能看整条产线每个环节的堆积；
+      编程岗 = 所有待编程 + 我编过且还没开工的（待生产），开工之后不再展示；
+      质检岗 = 只有待质检；
+      操作工 = 不开放（403），他看「我的工单」。
+
     全部岗位都只保留**当前有效合同**（状态=正常）下的订单，见下面的 blocked 过滤。
     """
     emp = _current_employee(user, db)
-    is_admin = emp.position == POSITION_ADMIN
-    is_operator = emp.position == POSITION_OPERATOR
-    # 管理员与测试账号是「全厂口径」：统计里的待质检/已质检都按全厂算，
-    # 否则管理员的「已质检」永远是 0（_require_qc 不让他做判定）。
-    factory_wide = is_admin or emp.is_test
-    # 测试账号是岗位并集：列表里每张单都同时带「待编程」「待质检」状态，
-    # 审核员不用换账号就能看到三条链路的入口。
-    # 管理员也算编程视角：他的范围本来就是全厂订单（_my_order_ids 里单独处理），
-    # 但不算编程视角的话，每张单都不会带 program_state，界面上就看不出哪张待编程。
+    factory_wide = emp.position == POSITION_ADMIN or emp.is_test
+    # 管理员也算编程视角：不给 program_state 的话，界面上看不出哪张待编程。
     is_programmer = (
         emp.position in (POSITION_PROGRAMMER, POSITION_ADMIN) or emp.is_test
     )
     is_qc = emp.position == POSITION_QC or emp.is_test
+    # 待检标注给质检岗和全厂口径（管理员要知道哪张在等检），
+    # 但只有质检岗能判定，can_judge 在下面单独判。
+    show_qc = is_qc or factory_wide
 
-    need_qc = is_qc or factory_wide
     # 待检映射算一次，_my_order_ids 和下面的行构造共用，别重复扫三张表
-    qc_pending = _qc_pending_by_order(db) if need_qc else {}
-    my_inspected = _my_inspected_order_ids(db, emp.id) if is_qc else set()
-    qc_done_ids = _inspected_order_ids(db) if factory_wide else my_inspected
-
+    qc_pending = _qc_pending_by_order(db) if show_qc else {}
     ids = _my_order_ids(db, emp, qc_pending)
     orders = db.query(Order).filter(Order.id.in_(ids)).all() if ids else []
     # 只留「当前有效合同」下的工单：blocked_orders 给出挂在取消/暂停/结案合同
@@ -2043,29 +2176,23 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
         qc_state = ""
         qc_stage = ""
         qc_qty = 0
-        if is_qc:
+        if show_qc:
             hit = qc_pending.get(o.id)
             if hit:
                 qc_state = QC_STATE_PENDING
                 qc_stage, qc_qty = hit
-            elif o.id in my_inspected:
-                qc_state = QC_STATE_DONE
-        # 这一行属于哪几张统计卡。口径只在服务端算一次，前端点卡片就按 key 筛，
-        # 不用拿 status 字符串再猜一遍（猜错了就是「点了没反应」那种 bug）。
-        keys = ["all"]
-        if program_state == PROGRAM_STATE_PENDING:
-            keys.append("program_pending")
-        elif program_state == PROGRAM_STATE_DONE:
-            keys.append("program_done")
-        if need_qc:
-            if o.id in qc_pending:
-                keys.append("qc_pending")
-            if o.id in qc_done_ids:
-                keys.append("qc_done")
-        # 「待生产」把「生产中」也算进来：对车间来说这两类都是还没做完的活。
-        # 只算「待生产」的话，操作工手上开着单的时候那张卡反而显示 0。
-        if status in (ORDER_STATUS_WAITING_PRODUCTION, ORDER_STATUS_IN_PRODUCTION):
-            keys.append("production")
+        # 状态列先说「这张单该谁动手」，再退到流水线状态。文案与统计卡一一对应：
+        # 待质检 → 待编程 → 待接单 → 待生产（含「齐备」）→ 其余流水线状态。
+        # 「待确认」「齐备」是 web 端接单 / 备料视角的词，车间看不懂，这里不出现。
+        display_status = status
+        if qc_state == QC_STATE_PENDING:
+            display_status = QC_STATE_PENDING
+        elif program_state == PROGRAM_STATE_PENDING:
+            display_status = PROGRAM_STATE_PENDING
+        elif o.current_step == 0:
+            display_status = "待接单"
+        elif o.current_step == PROGRAM_STEP:
+            display_status = ORDER_STATUS_WAITING_PRODUCTION
         items.append(
             MpMyOrderOut(
                 order_id=o.id,
@@ -2079,44 +2206,30 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
                 qc_stage=qc_stage,
                 qc_stage_label=STAGE_LABELS.get(qc_stage, ""),
                 qc_pending_qty=qc_qty,
-                display_status=qc_state or program_state or status,
+                display_status=display_status,
                 machining_minutes=o.machining_minutes,
                 estimated_hours=o.estimated_hours,
                 can_edit=_can_edit_program(o) and is_programmer,
-                can_judge=qc_state == QC_STATE_PENDING,
+                # 管理员看得到「待质检」标注，但判定只归质检岗
+                can_judge=qc_state == QC_STATE_PENDING and is_qc,
                 programmers=programmers.get(o.id, []),
-                stat_keys=keys,
+                # 这一行属于哪几张统计卡。口径只在服务端算一次，前端点卡片就按
+                # key 筛，不用拿 status 字符串再猜一遍（猜错就是「点了没反应」）。
+                stat_keys=_stat_keys_of(o, o.current_step, producing, qc_pending),
             )
         )
+
     # ---- 顶部统计卡：给哪几张由岗位决定，点哪张就筛哪一类 ----
     if factory_wide:
-        # 管理员「包含所有内容」：编程两项 + 质检两项 + 生产一项
-        stat_keys = [
-            "all", "program_pending", "program_done",
-            "qc_pending", "qc_done", "production",
-        ]
+        stat_keys = [key for key, _ in MY_ORDER_STATS]
     elif emp.position == POSITION_PROGRAMMER:
-        stat_keys = ["all", "program_pending", "program_done"]
+        # 编程只看自己这条链：待编程 + 编完还没开工的，生产中的单已经交出去了
+        stat_keys = ["all", "program_pending", "waiting_production"]
     elif emp.position == POSITION_QC:
-        stat_keys = ["all", "qc_pending", "qc_done"]
-    elif is_operator:
-        # 操作工的列表就是「我参与的」，所以第一张卡直接叫这个名字，
-        # 第二张才是他真正要盯的待办
-        stat_keys = ["all", "production"]
+        stat_keys = ["all", "qc_pending"]
     else:
         stat_keys = ["all"]
-
-    stat_labels = {
-        "all": "订单总数",
-        "program_pending": "待编程",
-        "program_done": "已编程",
-        "qc_pending": "待质检",
-        "qc_done": "已质检",
-        "production": "待生产",
-    }
-    # 操作工（以及没有专项待办的岗位）看到的就是「我参与的」，别叫订单总数
-    if is_operator or (not factory_wide and emp.position not in (POSITION_PROGRAMMER, POSITION_QC)):
-        stat_labels["all"] = "我参与的订单"
+    stat_labels = dict(MY_ORDER_STATS)
     stats = [
         MpMyOrderStatOut(
             key=key,
@@ -2133,8 +2246,8 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
         pending_count=sum(1 for i in items if i.program_state == PROGRAM_STATE_PENDING),
         programmed_count=sum(1 for i in items if i.program_state == PROGRAM_STATE_DONE),
         qc_pending_count=sum(1 for i in items if i.qc_state == QC_STATE_PENDING),
-        qc_done_count=sum(1 for i in items if i.qc_state == QC_STATE_DONE),
     )
+
 
 
 @router.get("/orders/{order_id}", response_model=MpOrderDetailOut)
