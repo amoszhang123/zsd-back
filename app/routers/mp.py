@@ -58,6 +58,7 @@ from app.models.quality import (
     ReworkOrder,
     ScrapOrder,
 )
+from app.models.shipment import shipped_order_ids
 from app.program_sheet import ProgramSheetError, parse_program_sheet
 from app.qr_image import render_qr_data_uri
 from app.quote_excel import XLSX_MIME, QuoteExportError, build_quote_xlsx, quote_filename
@@ -1529,6 +1530,9 @@ PROGRAM_STATE_PENDING = "待编程"
 PROGRAM_STATE_DONE = "已编程"
 QC_STATE_PENDING = "待质检"
 QC_STATE_DONE = "已质检"
+# 出货阶段的两种说法：还没开送货单 = 待出货（step7 的默认状态），开了就是已出货。
+# 订单出货后 current_step 不动，只能靠送货单区分，见 shipped_order_ids。
+ORDER_STATUS_SHIPPED = "已出货"
 
 
 class MpMyOrderOut(BaseModel):
@@ -1849,15 +1853,18 @@ def _stat_keys_of(
     step: int,
     producing: set[str],
     qc_pending: dict[str, tuple[str, int]],
+    shipped: set[str],
 ) -> list[str]:
     """一张订单落在哪几张统计卡上。
 
     工序口径（备料总开关关闭，一张单在生产链上只落一张卡）：
       待接单 = step0；待编程 = step2 未填程序时间；待生产 = step2 已填（齐备）
-      或 step3 未开工；生产中 = step3 已开工；待出货 = step7。
+      或 step3 未开工；生产中 = step3 已开工；待出货 = step7 且还没开送货单。
     「待生产」把「齐备」也算进来：程序填完就是在等开工，否则这些单只会出现在
     「订单总数」里，点不出来。
     「待质检」是叠加维度 —— 质检1 / 表处 / 质检2 任一阶段还有没检完的数量就挂上。
+    「待出货」要排掉已出货：出货后 current_step 仍停在 7，不查送货单会把发走的
+    货继续算成待办（与仪表盘交期预警同一份判断，见 shipped_order_ids）。
     """
     keys = ["all"]
     if step == 0:
@@ -1868,7 +1875,7 @@ def _stat_keys_of(
         )
     elif step == PRODUCTION_STEP:
         keys.append("in_production" if order.id in producing else "waiting_production")
-    elif step == SHIPPING_STEP:
+    elif step == SHIPPING_STEP and order.id not in shipped:
         keys.append("shipping")
     if order.id in qc_pending:
         keys.append("qc_pending")
@@ -2168,6 +2175,9 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
 
     producing = in_production_order_ids(db, [o.id for o in orders])
     programmers = _programmers_map(db, [o.id for o in orders])
+    # 出货阶段的单要再查一次送货单才能分「待出货 / 已出货」，只查一次复用给所有行
+    has_shipping = any(o.current_step == SHIPPING_STEP for o in orders)
+    shipped = shipped_order_ids(db) if has_shipping else set()
 
     items = []
     for o in orders:
@@ -2193,6 +2203,9 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
             display_status = "待接单"
         elif o.current_step == PROGRAM_STEP:
             display_status = ORDER_STATUS_WAITING_PRODUCTION
+        elif o.current_step == SHIPPING_STEP and o.id in shipped:
+            # 已经开了送货单：还写「待出货」会让人以为没发走，也统计进待出货卡
+            display_status = ORDER_STATUS_SHIPPED
         items.append(
             MpMyOrderOut(
                 order_id=o.id,
@@ -2215,7 +2228,7 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
                 programmers=programmers.get(o.id, []),
                 # 这一行属于哪几张统计卡。口径只在服务端算一次，前端点卡片就按
                 # key 筛，不用拿 status 字符串再猜一遍（猜错就是「点了没反应」）。
-                stat_keys=_stat_keys_of(o, o.current_step, producing, qc_pending),
+                stat_keys=_stat_keys_of(o, o.current_step, producing, qc_pending, shipped),
             )
         )
 

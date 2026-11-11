@@ -29,7 +29,7 @@ from app.models.quality import (
     ReworkOrder,
     ScrapOrder,
 )
-from app.models.shipment import Shipment, ShipmentItem
+from app.models.shipment import Shipment, ShipmentItem, shipped_order_ids
 from app.schemas.order import (
     DashboardAlert,
     DashboardStats,
@@ -45,17 +45,8 @@ DONE_STATUS = "已完成"
 
 
 def _shipped_order_ids(db: Session) -> set[str]:
-    """已经出现在任何出货单里的工单。
-
-    订单出货后 current_step 仍停在 7（待出货），只看 step 会把已出货的也算进预警。
-    """
-    rows = (
-        db.query(ShipmentItem.order_id)
-        .filter(ShipmentItem.order_id.isnot(None))
-        .distinct()
-        .all()
-    )
-    return {row[0] for row in rows}
+    """已经出现在任何出货单里的工单（口径见 models.shipment.shipped_order_ids）。"""
+    return shipped_order_ids(db)
 
 
 def _deadline_alerts(db: Session) -> tuple[list[DashboardAlert], list[DashboardAlert]]:

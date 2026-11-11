@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.database import Base
 from app.models.contract import Contract
@@ -53,3 +53,19 @@ class ShipmentItem(Base):
 
     shipment: Mapped["Shipment"] = relationship(back_populates="items")
     order: Mapped["Order | None"] = relationship()
+
+
+def shipped_order_ids(db: Session) -> set[str]:
+    """已经出现在任何一张送货单里的工单号。
+
+    订单出货后 current_step 仍停在 7（待出货），所以「待出货」与「已出货」只看
+    step 分不开 —— 必须再查一次出货明细。仪表盘的交期预警和「我的订单」的
+    待出货卡共用这一份口径，避免两处各写一遍后慢慢跑偏。
+    """
+    rows = (
+        db.query(ShipmentItem.order_id)
+        .filter(ShipmentItem.order_id.isnot(None))
+        .distinct()
+        .all()
+    )
+    return {row[0] for row in rows}
