@@ -1,3 +1,4 @@
+import base64
 import io
 import time
 from datetime import date, datetime
@@ -31,6 +32,8 @@ from app.schemas.order import (
     MachiningUpdate,
     OrderCreate,
     OrderImportRow,
+    OrderLabelPagesOut,
+    OrderLabelRequest,
     OrderResponse,
     OrderUpdate,
 )
@@ -489,6 +492,45 @@ def get_qrcode(order_id: str, db: Session = Depends(get_db)):
     return StreamingResponse(buf, media_type="image/png")
 
 
+def _label_seq_map(db: Session, order_ids: list[str]) -> dict[str, str]:
+    """order_id → 合同明细序号（同一单命中多条明细时取 seq 最小的一条）。
+
+    批量出图时一次查完，避免 N 张标签查 N 次合同明细。
+    """
+    if not order_ids:
+        return {}
+    rows = (
+        db.query(ContractItem.order_id, ContractItem.seq)
+        .filter(ContractItem.order_id.in_(order_ids))
+        .order_by(ContractItem.order_id, ContractItem.seq)
+        .all()
+    )
+    out: dict[str, str] = {}
+    for order_id, seq in rows:
+        # 单张接口的旧口径是「seq 为 0/None 就当没有」，这里保持一致
+        if order_id not in out and seq:
+            out[order_id] = str(seq)
+    return out
+
+
+def _label_data(order: Order, seq: str) -> LabelData:
+    """标签上的两种「会缺」的字段都在这里收口：
+
+    序号取合同明细 seq，交期取工单 deadline；交期为空时右下角留空，
+    前端会提示「未填交期」，不要在这里编个假日期上去。
+    """
+    return LabelData(
+        order_no=order.order_no,
+        project_no=order.project_no,
+        model=order.model,
+        material_no=order.material_no,
+        product=order.product,
+        quantity=order.quantity,
+        seq=seq,
+        deadline=f"{order.deadline.month}月{order.deadline.day}日" if order.deadline else "",
+    )
+
+
 @router.get("/{order_id}/label")
 def get_label(order_id: str, db: Session = Depends(get_db)):
     """订单码标签 PNG（80×60mm @300DPI），供 web 端接单管理预览与打印。
@@ -500,27 +542,47 @@ def get_label(order_id: str, db: Session = Depends(get_db)):
     if not order:
         raise HTTPException(404, "工单不存在")
 
-    item = (
-        db.query(ContractItem)
-        .filter(ContractItem.order_id == order.id)
-        .order_by(ContractItem.seq)
-        .first()
-    )
-    data = LabelData(
-        order_no=order.order_no,
-        project_no=order.project_no,
-        model=order.model,
-        material_no=order.material_no,
-        product=order.product,
-        quantity=order.quantity,
-        seq=str(item.seq) if item and item.seq else "",
-        deadline=f"{order.deadline.month}月{order.deadline.day}日" if order.deadline else "",
-    )
+    seq = _label_seq_map(db, [order.id]).get(order.id, "")
     try:
-        png = render_label(data, order_qr_image(order, box_size=1))
+        png = render_label(_label_data(order, seq), order_qr_image(order, box_size=1))
     except Exception as e:
         # 未捕获异常会被 Starlette 兜成纯文本 500，前端只能显示
         # 「Request failed with status code 500」，看不出是字体缺失这种可修问题。
         # 这里转成带原因的 500，管理端预览弹窗就能直接显示出来。
         raise HTTPException(500, f"标签渲染失败：{e}") from e
     return StreamingResponse(io.BytesIO(png), media_type="image/png")
+
+
+@router.post("/labels", response_model=OrderLabelPagesOut)
+def batch_labels(req: OrderLabelRequest, db: Session = Depends(get_db)):
+    """批量出图：勾 N 张就回 N 页，前端按页插分页符连着打。
+
+    顺序严格按传入的 order_ids 走 —— 调用方按表格里看到的顺序传，打出来就和
+    屏幕一致，不会出现「第一张是第五行」这种对不上的情况。
+
+    **全有全无**：只要有一张渲染不出来就整批 500，并把第几张、哪个单号带出来。
+    渲染错误多是缺字体 / 模板越界这类环境问题，同一批其余单也不可信；打一半出来
+    现场更难查，热敏纸还白烧。
+    """
+    orders = db.query(Order).filter(Order.id.in_(req.order_ids)).all()
+    by_id = {o.id: o for o in orders}
+    missing = [oid for oid in req.order_ids if oid not in by_id]
+    if missing:
+        head = "、".join(missing[:5])
+        more = f" 等 {len(missing)} 张" if len(missing) > 5 else ""
+        raise HTTPException(404, f"工单不存在：{head}{more}")
+
+    seqs = _label_seq_map(db, req.order_ids)
+    pages: list[str] = []
+    for idx, oid in enumerate(req.order_ids, start=1):
+        order = by_id[oid]
+        try:
+            png = render_label(
+                _label_data(order, seqs.get(oid, "")), order_qr_image(order, box_size=1)
+            )
+        except Exception as e:
+            raise HTTPException(500, f"第 {idx} 张（{oid}）标签渲染失败：{e}") from e
+        pages.append("data:image/png;base64," + base64.b64encode(png).decode())
+
+    return OrderLabelPagesOut(pages=pages)
+

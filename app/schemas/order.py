@@ -124,6 +124,21 @@ class BatchConfirmResponse(BaseModel):
     missing: list[str] = []
 
 
+# 单次批量出图上限。和 web 端的 pageSize 上限一致（100），日常合同 20~60 张都在区内；
+# 100 张 base64 后约 7MB，一次响应还稳，再多隐藏 iframe 里同时解码就会卡。
+LABEL_BATCH_MAX = 100
+
+
+class OrderLabelRequest(BaseModel):
+    order_ids: list[str] = Field(min_length=1, max_length=LABEL_BATCH_MAX)
+
+
+class OrderLabelPagesOut(BaseModel):
+    """80×60 热敏一页一张，前端按页插分页符连着打（与机台/物料的同名结构一致）。"""
+
+    pages: list[str] = []
+
+
 class DashboardStats(BaseModel):
     today_orders: int = 0
     in_production: int = 0
