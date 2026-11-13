@@ -447,6 +447,10 @@ def get_employee_info(user=Depends(_get_mp_user), db: Session = Depends(get_db))
         "position": emp.position,
         "status": emp.status,
         "phone": phone,
+        # 工作台在姓名旁显示「在职 N 天」。入职当天算第 1 天，没录入职日期就给 None，
+        # 前端据此把这一小块整个隐掉 —— 显示「在职 0 天」比不显示更容易让人误会
+        "hire_date": emp.hire_date.isoformat() if emp.hire_date else None,
+        "tenure_days": ((date.today() - emp.hire_date).days + 1) if emp.hire_date else None,
     }
 
 
