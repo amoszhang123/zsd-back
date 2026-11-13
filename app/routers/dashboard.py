@@ -29,7 +29,7 @@ from app.models.quality import (
     ReworkOrder,
     ScrapOrder,
 )
-from app.models.shipment import Shipment, ShipmentItem, shipped_order_ids
+from app.models.shipment import Shipment, ShipmentItem, fulfilled_order_ids
 from app.schemas.order import (
     DashboardAlert,
     DashboardStats,
@@ -44,15 +44,18 @@ WARN_DAYS = 3
 DONE_STATUS = "已完成"
 
 
-def _shipped_order_ids(db: Session) -> set[str]:
-    """已经出现在任何出货单里的工单（口径见 models.shipment.shipped_order_ids）。"""
-    return shipped_order_ids(db)
+def _fulfilled_order_ids(db: Session) -> set[str]:
+    """已经全量出货（完结）的工单（口径见 models.shipment.fulfilled_order_ids）。
+
+    只发了一部分的单不算完 —— 它还欠客户货，交期预警必须继续盯着它。
+    """
+    return fulfilled_order_ids(db)
 
 
 def _deadline_alerts(db: Session) -> tuple[list[DashboardAlert], list[DashboardAlert]]:
-    """返回 (超期, 临期) 两组。只统计未出货、且填了交期的工单。"""
+    """返回 (超期, 临期) 两组。只统计未完结、且填了交期的工单。"""
     today = date.today()
-    shipped = _shipped_order_ids(db)
+    fulfilled = _fulfilled_order_ids(db)
     orders = (
         db.query(Order)
         .filter(
@@ -66,7 +69,7 @@ def _deadline_alerts(db: Session) -> tuple[list[DashboardAlert], list[DashboardA
     overdue: list[tuple[int, DashboardAlert]] = []
     due_soon: list[tuple[int, DashboardAlert]] = []
     for o in orders:
-        if o.id in shipped:
+        if o.id in fulfilled:
             continue
         days = (o.deadline - today).days
         status = ORDER_STATUS_LABELS[o.current_step]

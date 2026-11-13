@@ -47,6 +47,8 @@ class OrderResponse(BaseModel):
     contract_id: str = ""
     # 所属合同的状态（正常/暂停/取消/结案）。非「正常」时该工单不能接单，前端据此置灰。
     contract_status: str = ""
+    # 这张单是在「历史补偿模式」下绕过终检出的货，详情页据此标「历史补录」
+    qc_override_shipped: bool = False
     create_date: date | None = None
     deadline: date | None = None
     steps: list[StepSchema] = []

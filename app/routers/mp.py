@@ -22,6 +22,7 @@ from app.database import get_db, scoped
 from app.models.contract import blocked_orders
 from app.models.cost import CostInvoice
 from app.models.order import (
+    ORDER_STATUS_FULFILLED,
     ORDER_STATUS_IN_PRODUCTION,
     ORDER_STATUS_WAITING_PRODUCTION,
     PRODUCTION_STEP,
@@ -58,7 +59,7 @@ from app.models.quality import (
     ReworkOrder,
     ScrapOrder,
 )
-from app.models.shipment import shipped_order_ids
+from app.models.shipment import fulfilled_order_ids, shipped_qty_map
 from app.program_sheet import ProgramSheetError, parse_program_sheet
 from app.qr_image import render_qr_data_uri
 from app.quote_excel import XLSX_MIME, QuoteExportError, build_quote_xlsx, quote_filename
@@ -1530,11 +1531,6 @@ PROGRAM_STATE_PENDING = "待编程"
 PROGRAM_STATE_DONE = "已编程"
 QC_STATE_PENDING = "待质检"
 QC_STATE_DONE = "已质检"
-# 出货阶段的两种说法：还没开送货单 = 待出货（step7 的默认状态），开了就是已出货。
-# 订单出货后 current_step 不动，只能靠送货单区分，见 shipped_order_ids。
-ORDER_STATUS_SHIPPED = "已出货"
-
-
 class MpMyOrderOut(BaseModel):
     """「我的订单」列表项：订单号 + 订单状态 + 能不能编辑。"""
 
@@ -1853,7 +1849,7 @@ def _stat_keys_of(
     step: int,
     producing: set[str],
     qc_pending: dict[str, tuple[str, int]],
-    shipped: set[str],
+    fulfilled: set[str],
 ) -> list[str]:
     """一张订单落在哪几张统计卡上。
 
@@ -1863,8 +1859,9 @@ def _stat_keys_of(
     「待生产」把「齐备」也算进来：程序填完就是在等开工，否则这些单只会出现在
     「订单总数」里，点不出来。
     「待质检」是叠加维度 —— 质检1 / 表处 / 质检2 任一阶段还有没检完的数量就挂上。
-    「待出货」要排掉已出货：出货后 current_step 仍停在 7，不查送货单会把发走的
-    货继续算成待办（与仪表盘交期预警同一份判断，见 shipped_order_ids）。
+    「待出货」要排掉已完结：部分出货的单还欠着货，仍然挂在待出货里；
+    只有累计出货量够数（orders.fulfilled_at）才算真出完（与仪表盘交期预警同一份
+    判断，见 fulfilled_order_ids）。
     """
     keys = ["all"]
     if step == 0:
@@ -1875,7 +1872,7 @@ def _stat_keys_of(
         )
     elif step == PRODUCTION_STEP:
         keys.append("in_production" if order.id in producing else "waiting_production")
-    elif step == SHIPPING_STEP and order.id not in shipped:
+    elif step == SHIPPING_STEP and order.id not in fulfilled:
         keys.append("shipping")
     if order.id in qc_pending:
         keys.append("qc_pending")
@@ -2175,9 +2172,11 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
 
     producing = in_production_order_ids(db, [o.id for o in orders])
     programmers = _programmers_map(db, [o.id for o in orders])
-    # 出货阶段的单要再查一次送货单才能分「待出货 / 已出货」，只查一次复用给所有行
+    # 出货阶段的单要再查一次送货单才能分「待出货 / 已完结」和「已出 x/y」，
+    # 只查一次复用给所有行
     has_shipping = any(o.current_step == SHIPPING_STEP for o in orders)
-    shipped = shipped_order_ids(db) if has_shipping else set()
+    fulfilled = fulfilled_order_ids(db) if has_shipping else set()
+    shipped_qty = shipped_qty_map(db, [o.id for o in orders]) if has_shipping else {}
 
     items = []
     for o in orders:
@@ -2203,9 +2202,14 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
             display_status = "待接单"
         elif o.current_step == PROGRAM_STEP:
             display_status = ORDER_STATUS_WAITING_PRODUCTION
-        elif o.current_step == SHIPPING_STEP and o.id in shipped:
-            # 已经开了送货单：还写「待出货」会让人以为没发走，也统计进待出货卡
-            display_status = ORDER_STATUS_SHIPPED
+        elif o.current_step == SHIPPING_STEP:
+            # 出货阶段三种说法：出完 = 已完结；出了一部分 = 待出货（已出 x/y）；
+            # 一件没发 = 待出货。只写「已出货」会把只发了一半的单说成做完了。
+            done = shipped_qty.get(o.id, 0)
+            if o.id in fulfilled:
+                display_status = ORDER_STATUS_FULFILLED
+            elif done > 0:
+                display_status = f"待出货（已出 {done}/{o.quantity}）"
         items.append(
             MpMyOrderOut(
                 order_id=o.id,
@@ -2228,7 +2232,7 @@ def my_orders(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
                 programmers=programmers.get(o.id, []),
                 # 这一行属于哪几张统计卡。口径只在服务端算一次，前端点卡片就按
                 # key 筛，不用拿 status 字符串再猜一遍（猜错就是「点了没反应」）。
-                stat_keys=_stat_keys_of(o, o.current_step, producing, qc_pending, shipped),
+                stat_keys=_stat_keys_of(o, o.current_step, producing, qc_pending, fulfilled),
             )
         )
 

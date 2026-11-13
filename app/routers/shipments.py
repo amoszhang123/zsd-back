@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
@@ -8,10 +8,15 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models.contract import Contract, ContractItem
-from app.models.order import Order, resolve_order_status
+from app.models.order import SHIPPING_STEP, Order, OrderStep, resolve_order_status
 from app.models.production import in_production_order_ids
 from app.models.quality import QcInspection
-from app.models.shipment import Shipment, ShipmentItem
+from app.models.shipment import (
+    Shipment,
+    ShipmentItem,
+    fulfilled_order_ids,
+    shipped_qty_map,
+)
 from app.schemas.shipment import (
     ContractOrderOut,
     ContractProgressOut,
@@ -143,6 +148,8 @@ def _to_out(shipment: Shipment, prices: dict[str, float]) -> ShipmentOut:
         item_count=len(shipment.items),
         total_quantity=sum(i.quantity for i in shipment.items),
         total_amount=round(total_amount, 2),
+        qc_override=shipment.qc_override,
+        qc_override_note=shipment.qc_override_note,
         items=items,
     )
 
@@ -152,12 +159,16 @@ def list_contract_progress(db: Session = Depends(get_db)):
     contracts = (
         db.query(Contract).order_by(Contract.created_at.desc(), Contract.id.desc()).all()
     )
+    fulfilled = fulfilled_order_ids(db)
     result = []
     for contract in contracts:
         rows = _load_contract_rows(db, contract)
         shipped = _shipped_doc_map(db, contract.id)
         total_qty = sum(item.quantity for item, _, _ in rows)
         counted = sum(q.get("pass", 0) for _, _, q in rows)
+        order_ids = [item.order_id for item, _, _ in rows if item.order_id]
+        shipped_qty = shipped_qty_map(db, order_ids)
+        shipped_qty_total = sum(shipped_qty.get(oid, 0) for oid in order_ids)
         result.append(
             ContractProgressOut(
                 contract_id=contract.id,
@@ -170,11 +181,14 @@ def list_contract_progress(db: Session = Depends(get_db)):
                 total_quantity=total_qty,
                 order_count=sum(1 for _, order, _ in rows if order),
                 qc2_pass_quantity=counted,
-                completion_rate=round(counted / total_qty * 100, 1) if total_qty else 0.0,
+                # 完成度 = 已出货数量 ÷ 合同数量（出货进度）。以前按质检2 合格数算，
+                # 历史补偿出货之后会出现「货都发完了、完成度还是 0%」的鬼话。
+                completion_rate=round(shipped_qty_total / total_qty * 100, 1) if total_qty else 0.0,
                 qc2_passed_orders=sum(
                     1 for _, _, q in rows if q.get("verdict") == QC2_VERDICT_PASS
                 ),
                 shipped_orders=sum(1 for item, _, _ in rows if item.order_id in shipped),
+                fulfilled_orders=sum(1 for item, _, _ in rows if item.order_id in fulfilled),
                 shipment_count=(
                     db.query(func.count(Shipment.id))
                     .filter(Shipment.contract_id == contract.id)
@@ -194,11 +208,12 @@ def list_contract_orders(contract_id: str, db: Session = Depends(get_db)):
 
     shipped = _shipped_doc_map(db, contract_id)
     rows = list(_load_contract_rows(db, contract))
-    producing = in_production_order_ids(
-        db, [item.order_id for item, order, _ in rows if item.order_id]
-    )
+    order_ids = [item.order_id for item, _, _ in rows if item.order_id]
+    shipped_qty = shipped_qty_map(db, order_ids)
+    producing = in_production_order_ids(db, order_ids)
     out = []
     for item, order, q in rows:
+        done = shipped_qty.get(item.order_id or "", 0)
         out.append(
             ContractOrderOut(
                 order_id=item.order_id or "",
@@ -213,7 +228,12 @@ def list_contract_orders(contract_id: str, db: Session = Depends(get_db)):
                 qc2_status=q.get("verdict", ""),
                 qc2_pass_count=q.get("pass", 0),
                 counted_quantity=q.get("pass", 0),
-                shipped=bool(item.order_id and item.order_id in shipped),
+                shipped=done > 0,
+                shipped_quantity=done,
+                # 完结口径：累计出货数量够数。与 create_shipment 里写 fulfilled_at
+                # 用的是同一个比较，两边必须一致，否则界面和实际状态会打架。
+                fulfilled=bool(order and order.fulfilled_at),
+                remaining_quantity=max(0, item.quantity - done),
                 shipment_doc_no=shipped.get(item.order_id, "") if item.order_id else "",
             )
         )
@@ -244,19 +264,39 @@ def create_shipment(req: ShipmentCreate, db: Session = Depends(get_db)):
         project_key = contract_item.project_no or "未指定项目号"
         groups.setdefault(project_key, []).append((entry, contract_item))
 
+    # 分批出货：出过一部分的单还能接着出，但出满了就不能再出 —— 否则累计数量会
+    # 超过合同数量，完结状态和实物都对不上。这里按「合同数量」判，与完结口径一致。
+    shipped_before = shipped_qty_map(db, [e.order_id for e in req.items])
+    already_full = [
+        f"{e.order_id}（已出 {shipped_before.get(e.order_id, 0)}/{items_by_order[e.order_id].quantity}）"
+        for e in req.items
+        if shipped_before.get(e.order_id, 0) >= items_by_order[e.order_id].quantity
+    ]
+    if already_full:
+        raise HTTPException(400, f"以下工单已出满，不能再出货: {'、'.join(already_full)}")
+
     # 只有终检判定「合格」的工单能出货。前端勾选框也禁掉了未合格的，但那能绕过，
     # 规则得在这里兜住。整批一次性报全，免得用户一条条试。
-    qc2 = _qc2_summary(db, [e.order_id for e in req.items])
+    #
+    # req.qc_override=True 是「历史补偿模式」：历史单大量停在程序/质检环节，终检根本
+    # 没做过，要补开出货单只能显式绕过。放行不等于无条件：已出满的仍然拦住（见上），
+    # 而且每一张被放行的工单都会把「未终检 / 返工 / 报废 / 维修」写进送货单备注字段，
+    # 事后能查。默认 False，日常出货仍按合格才放行的老规则。
+    order_ids = [e.order_id for e in req.items]
+    qc2 = _qc2_summary(db, order_ids)
     not_passed = [
-        (e.order_id, qc2.get(e.order_id, {}).get("verdict", ""))
-        for e in req.items
-        if qc2.get(e.order_id, {}).get("verdict", "") != QC2_VERDICT_PASS
+        (oid, qc2.get(oid, {}).get("verdict", ""))
+        for oid in order_ids
+        if qc2.get(oid, {}).get("verdict", "") != QC2_VERDICT_PASS
     ]
-    if not_passed:
+    if not_passed and not req.qc_override:
         detail = "、".join(
             f"{oid}（{QC2_VERDICT_LABELS.get(v, v)}）" for oid, v in not_passed
         )
         raise HTTPException(400, f"以下工单终检未合格，不能生成出货单: {detail}")
+    override_reason = {
+        oid: QC2_VERDICT_LABELS.get(v, v) or "未终检" for oid, v in not_passed
+    }
 
     address = req.address.strip()
     if not address:
@@ -264,6 +304,12 @@ def create_shipment(req: ShipmentCreate, db: Session = Depends(get_db)):
 
     created = []
     for project_no, entries in groups.items():
+        # 放行说明按单张送货单各自记：这张单里错了哪几张，就写哪几张
+        override_note = "、".join(
+            f"{entry.order_id} {override_reason[entry.order_id]}"
+            for entry, _ in entries
+            if entry.order_id in override_reason
+        )
         shipment = Shipment(
             doc_no=_next_doc_no(db, date.today()),
             contract_id=contract.id,
@@ -272,6 +318,8 @@ def create_shipment(req: ShipmentCreate, db: Session = Depends(get_db)):
             address=address,
             purchase_no=contract.purchase_no,
             ship_from=settings.ship_from_company,
+            qc_override=bool(override_note),
+            qc_override_note=override_note,
         )
         db.add(shipment)
         db.flush()
@@ -290,6 +338,35 @@ def create_shipment(req: ShipmentCreate, db: Session = Depends(get_db)):
                 )
             )
         created.append(shipment)
+
+    # 出货后回写工单：current_step 只进不退地推到出货阶段；累计数量够数就写完结时间，
+    # 并把流水线里的「出货」步骤标成已完成（补偿单跳过的 3~6 步保持原状，绝不补假记录）。
+    order_ids = [e.order_id for e in req.items]
+    orders_by_id = {o.id: o for o in db.query(Order).filter(Order.id.in_(order_ids)).all()}
+    shipping_steps = {
+        s.order_id: s
+        for s in db.query(OrderStep)
+        .filter(OrderStep.order_id.in_(order_ids), OrderStep.step_key == "shipping")
+        .all()
+    }
+    now = datetime.now()
+    for entry in req.items:
+        order = orders_by_id.get(entry.order_id)
+        if not order:
+            continue
+        target = items_by_order[entry.order_id].quantity
+        total = shipped_before.get(entry.order_id, 0) + entry.quantity
+        if order.current_step < SHIPPING_STEP:
+            order.current_step = SHIPPING_STEP
+        step = shipping_steps.get(order.id)
+        if total >= target:
+            if order.fulfilled_at is None:
+                order.fulfilled_at = now
+            if step:
+                step.status = "completed"
+                step.time = date.today()
+        elif step and step.status != "completed":
+            step.status = "processing"
 
     db.commit()
     for shipment in created:

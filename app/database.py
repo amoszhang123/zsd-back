@@ -145,6 +145,22 @@ def init_db():
             "开工单号回填失败，可手动重跑：python -m app.work_order_code"
         )
 
+    # fulfilled_at 是后加的列：之前开过送货单、而且已经出满的工单要补上完结时间，
+    # 否则它们会卡在「待出货（已出 16/16）」——既不算待出货，也不算已完结。
+    # 幂等：只补 fulfilled_at 为空且累计出货量够数的行。
+    try:
+        from app.models.shipment import backfill_fulfilled
+
+        fixed = backfill_fulfilled()
+        if fixed:
+            import logging
+
+            logging.getLogger(__name__).info("出货完结状态回填：%s 张工单", fixed)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("出货完结状态回填失败，不影响启动")
+
 
 def _column_ddl(table: str, col) -> str:
     """把模型上的一列渲染成 MySQL 的 ADD COLUMN 语句。

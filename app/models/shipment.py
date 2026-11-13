@@ -1,11 +1,11 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.database import Base
 from app.models.contract import Contract
-from app.models.order import Order
+from app.models.order import SHIPPING_STEP, Order
 
 
 class Shipment(Base):
@@ -26,6 +26,11 @@ class Shipment(Base):
     purchase_no: Mapped[str] = mapped_column(String(50), default="")
     ship_from: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    # 这张送货单是在「历史补偿模式」下、绕过终检开出来的。只做内部追溯，
+    # 不打印在送货单上 —— 客户不需要知道我们内部跳过了哪道工序。
+    qc_override: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 自动生成放行说明，如「WO22105AA 未终检、WO22106BA 报废」
+    qc_override_note: Mapped[str] = mapped_column(String(500), default="")
 
     contract: Mapped["Contract"] = relationship()
     items: Mapped[list["ShipmentItem"]] = relationship(
@@ -55,17 +60,92 @@ class ShipmentItem(Base):
     order: Mapped["Order | None"] = relationship()
 
 
-def shipped_order_ids(db: Session) -> set[str]:
-    """已经出现在任何一张送货单里的工单号。
+def shipped_qty_map(db: Session, order_ids: list[str] | None = None) -> dict[str, int]:
+    """工单 → 累计已出货数量（多张送货单的用量相加）。
 
-    订单出货后 current_step 仍停在 7（待出货），所以「待出货」与「已出货」只看
-    step 分不开 —— 必须再查一次出货明细。仪表盘的交期预警和「我的订单」的
-    待出货卡共用这一份口径，避免两处各写一遍后慢慢跑偏。
+    「出满没有」和「还能再出多少」都靠它；只传 order_ids 时范围限定在这批工单，
+    不传就是全表汇总。
     """
-    rows = (
-        db.query(ShipmentItem.order_id)
-        .filter(ShipmentItem.order_id.isnot(None))
-        .distinct()
-        .all()
+    query = db.query(ShipmentItem.order_id, func.sum(ShipmentItem.quantity)).filter(
+        ShipmentItem.order_id.isnot(None)
     )
+    if order_ids is not None:
+        if not order_ids:
+            return {}
+        query = query.filter(ShipmentItem.order_id.in_(order_ids))
+    rows = query.group_by(ShipmentItem.order_id).all()
+    return {order_id: int(qty or 0) for order_id, qty in rows}
+
+
+def fulfilled_order_ids(db: Session) -> set[str]:
+    """已经全量出货（完结）的工单号。
+
+    到货判定见 routers/shipments.py：累计出货数量 ≥ 工单数量才写 fulfilled_at。
+    仪表盘的交期预警、小程序的「待出货」卡都只认这个口径 —— 用「出过货」会把
+    只发了一部分的单从待办里抹掉。
+    """
+    rows = db.query(Order.id).filter(Order.fulfilled_at.isnot(None)).all()
     return {row[0] for row in rows}
+
+
+def overridden_order_ids(db: Session, order_ids: list[str] | None = None) -> set[str]:
+    """在「历史补偿模式」下绕过终检出过货的工单号（送货单上留了放行说明的那批）。
+
+    订单详情页据此标「历史补录」；列表页一次查完，别逐条查。
+    """
+    query = (
+        db.query(ShipmentItem.order_id)
+        .join(Shipment, Shipment.id == ShipmentItem.shipment_id)
+        .filter(Shipment.qc_override.is_(True), ShipmentItem.order_id.isnot(None))
+    )
+    if order_ids is not None:
+        if not order_ids:
+            return set()
+        query = query.filter(ShipmentItem.order_id.in_(order_ids))
+    return {row[0] for row in query.distinct().all()}
+
+
+def backfill_fulfilled() -> int:
+    """把「出货记录早于 fulfilled_at 列」的历史单补上完结时间。
+
+    幂等：只处理 fulfilled_at 为空、且累计出货量已经够数的工单；补过的不会再动。
+    不这么做的话，改动之前开过送货单的单会一直显示「待出货（已出 16/16）」，
+    既不在待出货卡里，也不算已完结。
+    """
+    from sqlalchemy import text
+
+    from app.database import engine
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                UPDATE orders o
+                JOIN (
+                    SELECT order_id, SUM(quantity) AS q
+                    FROM shipment_items
+                    WHERE order_id IS NOT NULL
+                    GROUP BY order_id
+                ) s ON s.order_id = o.id
+                SET o.fulfilled_at = NOW(),
+                    o.current_step = GREATEST(o.current_step, :shipping)
+                WHERE o.fulfilled_at IS NULL AND o.quantity > 0 AND s.q >= o.quantity
+                """
+            ),
+            {"shipping": SHIPPING_STEP},
+        )
+        # 顺带把流水线里的「出货」步骤标成已完成，否则详情页会出现
+        # 「状态已完结、流程条还停在等待」的自相矛盾
+        conn.execute(
+            text(
+                """
+                UPDATE order_steps os
+                JOIN orders o ON o.id = os.order_id
+                SET os.status = 'completed', os.time = DATE(o.fulfilled_at)
+                WHERE os.step_key = 'shipping'
+                  AND o.fulfilled_at IS NOT NULL
+                  AND os.status <> 'completed'
+                """
+            )
+        )
+    return result.rowcount or 0

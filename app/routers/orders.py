@@ -13,8 +13,10 @@ from app.database import get_db
 from app.models.contract import Contract, ContractItem, blocked_orders
 from app.models.order import (
     MATERIAL_PREP_ENABLED,
+    ORDER_STATUS_FULFILLED,
     ORDER_STATUS_LABELS,
     PROGRAM_STEP,
+    SHIPPING_STEP,
     STEP_KEYS,
     STEP_LABELS,
     Order,
@@ -26,6 +28,7 @@ from app.models.order import (
 )
 from app.models.production import in_production_order_ids
 from app.models.quality import QcInspection
+from app.models.shipment import overridden_order_ids, shipped_qty_map
 from app.order_label import LabelData, order_qr_image, render_label
 from app.schemas.order import (
     BatchConfirmRequest,
@@ -93,8 +96,19 @@ def _to_response(
     contract_status: str = "",
     quality_results: list | None = None,
     in_production_ids: set[str] | None = None,
+    shipped_qty: dict[str, int] | None = None,
+    qc_override_shipped: bool = False,
 ) -> dict:
     steps = sorted(order.steps, key=lambda s: s.sort_order) if order.steps else []
+    # 出货阶段有三种说法：待出货（一件没发）/ 待出货（已出 8/12）/ 已完结（够数）。
+    # 完结只能看 fulfilled_at —— step 7 是流水线最后一步，出没出完它都停在 7。
+    status = resolve_order_status(order, in_production_ids)
+    if order.fulfilled_at:
+        status = ORDER_STATUS_FULFILLED
+    elif order.current_step == SHIPPING_STEP:
+        done = (shipped_qty or {}).get(order.id, 0)
+        if done > 0:
+            status = f"待出货（已出 {done}/{order.quantity}）"
     return {
         "id": order.id,
         "order_no": order.order_no,
@@ -109,9 +123,11 @@ def _to_response(
         "priority": order.priority,
         "order_type": order.order_type,
         "current_step": order.current_step,
-        "status": resolve_order_status(order, in_production_ids),
+        "status": status,
         "contract_id": contract_id,
         "contract_status": contract_status,
+        # 这张单是在「历史补偿模式」下绕过终检出的货：详情页据此标「历史补录」
+        "qc_override_shipped": qc_override_shipped,
         "create_date": order.create_date,
         "deadline": order.deadline,
         "steps": [
@@ -174,6 +190,8 @@ def _respond(db: Session, order: Order) -> dict:
         contract_status,
         _quality_results_map(db, [order.id]).get(order.id, []),
         in_production_order_ids(db, [order.id]),
+        shipped_qty_map(db, [order.id]),
+        order.id in overridden_order_ids(db, [order.id]),
     )
 
 
@@ -204,12 +222,17 @@ def list_orders(
     contracts = _contract_map(db, ids)
     qualities = _quality_results_map(db, ids)
     producing = in_production_order_ids(db, ids)
+    shipped_qty = shipped_qty_map(db, ids)
+    overridden = overridden_order_ids(db, ids)
 
     result = []
     for o in orders:
         contract_id, contract_status = contracts.get(o.id, ("", ""))
         result.append(
-            _to_response(o, contract_id, contract_status, qualities.get(o.id, []), producing)
+            _to_response(
+                o, contract_id, contract_status, qualities.get(o.id, []),
+                producing, shipped_qty, o.id in overridden,
+            )
         )
     return result
 

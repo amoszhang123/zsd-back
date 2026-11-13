@@ -14,6 +14,10 @@ class ShipmentCreate(BaseModel):
     contract_id: str
     address: str = Field(min_length=1)
     items: list[ShipmentItemIn] = Field(min_length=1)
+    # 历史补偿：允许未终检（或终检判定返工/报废/维修）的工单出货。
+    # 前端的「历史补偿模式」开关只是把这个人肉动作显式化，最终必须由这里放行，
+    # 否则接口仍按老规则一律 400。
+    qc_override: bool = False
 
 
 class ShipmentItemOut(BaseModel):
@@ -46,6 +50,9 @@ class ShipmentOut(BaseModel):
     item_count: int = 0
     total_quantity: int = 0
     total_amount: float = 0.0
+    # 是否在历史补偿模式下绕过终检开出来的（仅内部追溯，不打印在送货单上）
+    qc_override: bool = False
+    qc_override_note: str = ""
     items: list[ShipmentItemOut] = []
 
 
@@ -64,7 +71,10 @@ class ContractProgressOut(BaseModel):
     qc2_pass_quantity: int = 0
     completion_rate: float = 0.0
     qc2_passed_orders: int = 0
+    # 出过货的工单数（含只发了一部分的）
     shipped_orders: int = 0
+    # 已全量出货、真正完结的工单数，列表里展示的是这个
+    fulfilled_orders: int = 0
     shipment_count: int = 0
 
 
@@ -83,5 +93,11 @@ class ContractOrderOut(BaseModel):
     qc2_status: str = ""
     qc2_pass_count: int = 0
     counted_quantity: int = 0
+    # 出过货（可能只出了一部分）
     shipped: bool = False
+    shipped_quantity: int = 0
+    # 累计出货量已够数 → 完结
+    fulfilled: bool = False
+    # 还能再出多少：合同数量 - 累计已出，最小 0
+    remaining_quantity: int = 0
     shipment_doc_no: str = ""

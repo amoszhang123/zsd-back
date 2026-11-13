@@ -46,6 +46,10 @@ class Order(TenantScoped, Base):
     current_step: Mapped[int] = mapped_column(Integer, default=0)
     create_date: Mapped[date] = mapped_column(Date, default=datetime.now)
     deadline: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # 全量出货时间（累计出货数量 ≥ 工单数量）。NULL = 还没出完。
+    # 流水线只有 8 步（step7 就是出货），没有"完结"这一步，所以完结只能靠这个时间戳表达；
+    # 部分出货不算完结，订单不会因为"出过一张送货单"就从待出货里消失。
+    fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     steps: Mapped[list["OrderStep"]] = relationship(back_populates="order", cascade="all, delete-orphan")
     materials: Mapped[list["OrderMaterial"]] = relationship(back_populates="order", cascade="all, delete-orphan")
@@ -57,7 +61,6 @@ class Order(TenantScoped, Base):
 STEP_KEYS = ["order", "material", "program", "production", "quality1", "surface", "quality2", "shipping"]
 STEP_LABELS = ["接单", "备料", "程序", "投产", "质检1", "表处", "质检2", "出货"]
 ORDER_STATUS_LABELS = ["待确认", "备料中", "齐备", "待生产", "质检中", "表处中", "终检中", "待出货"]
-
 # 生产阶段(step 3)有两个显示状态：
 #   待生产 = ORDER_STATUS_LABELS[3]，接单后的默认状态
 #   生产中 = 有员工的开工单包含该订单，且那张开工单尚未完工
@@ -65,6 +68,9 @@ ORDER_STATUS_LABELS = ["待确认", "备料中", "齐备", "待生产", "质检�
 # 都得记得同步它，漏一处状态就说谎。
 ORDER_STATUS_WAITING_PRODUCTION = "待生产"
 ORDER_STATUS_IN_PRODUCTION = "生产中"
+# 已完结 = 累计出货数量已够数（orders.fulfilled_at 非空）。出货阶段里它是
+# 「待出货」之后的第三个说法，只有它才算这张单真的做完了。
+ORDER_STATUS_FULFILLED = "已完结"
 
 # 投产阶段的下标：开工只能选处于该阶段的订单，质检打回也退回到这里
 PRODUCTION_STEP = STEP_KEYS.index("production")
