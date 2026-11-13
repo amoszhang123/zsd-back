@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
@@ -56,6 +57,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 批量订单码一次回 88 页 base64（约 1.6MB），生产带宽只有 ~0.5MB/s；
+# base64 有 33% 的膨胀是纯冗余，gzip 能压掉约三成（实测 1482KB → 1046KB）。
+# 放在 CORS 之后注册 = 包在外层，先压缩再补 CORS 头。
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.include_router(health.router)
 app.include_router(dashboard.router)

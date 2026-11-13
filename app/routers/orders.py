@@ -1,6 +1,8 @@
 import base64
 import io
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -492,6 +494,12 @@ def get_qrcode(order_id: str, db: Session = Depends(get_db)):
     return StreamingResponse(buf, media_type="image/png")
 
 
+# 标签渲染线程数。生产容器 CPU 弱（单张 ~0.17s），88 张串行会撞前端超时；
+# 渲染是纯 CPU 且 PIL 绘制/zlib 压缩都释放 GIL，4 路并发能吃掉大部分墙钟时间。
+# 不设成 CPU 核数：批量出图不该把整个容器的核占满，其它接口还要响应。
+_LABEL_RENDER_WORKERS = max(1, min(4, os.cpu_count() or 1))
+
+
 def _label_seq_map(db: Session, order_ids: list[str]) -> dict[str, str]:
     """order_id → 合同明细序号（同一单命中多条明细时取 seq 最小的一条）。
 
@@ -573,16 +581,35 @@ def batch_labels(req: OrderLabelRequest, db: Session = Depends(get_db)):
         raise HTTPException(404, f"工单不存在：{head}{more}")
 
     seqs = _label_seq_map(db, req.order_ids)
-    pages: list[str] = []
-    for idx, oid in enumerate(req.order_ids, start=1):
-        order = by_id[oid]
-        try:
-            png = render_label(
-                _label_data(order, seqs.get(oid, "")), order_qr_image(order, box_size=1)
-            )
-        except Exception as e:
-            raise HTTPException(500, f"第 {idx} 张（{oid}）标签渲染失败：{e}") from e
-        pages.append("data:image/png;base64," + base64.b64encode(png).decode())
+    # 取数与排版在主线程做完，工作线程只碰纯内存对象（Session 不能跨线程）。
+    jobs = [
+        (
+            idx,
+            oid,
+            _label_data(by_id[oid], seqs.get(oid, "")),
+            order_qr_image(by_id[oid], box_size=1),
+        )
+        for idx, oid in enumerate(req.order_ids, start=1)
+    ]
+    workers = min(len(jobs), _LABEL_RENDER_WORKERS)
+    if workers > 1:
+        # 单张渲染在生产机上要 ~0.17s（本机 12ms，容器 CPU 弱且不是一个人用），
+        # 88 张串行 15s 正好撞上前端 15s 超时 —— 现场反馈的「打印超时」就是这条。
+        # 渲染是纯 CPU，PIL 的绘制与 zlib 压缩都会释放 GIL，多线程能吃下这部分。
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pages = list(pool.map(_render_label_page, jobs))
+    else:
+        pages = [_render_label_page(job) for job in jobs]
 
     return OrderLabelPagesOut(pages=pages)
+
+
+def _render_label_page(job) -> str:
+    """渲染一张标签并转成 data URI。异常带上「第几张 + 单号」，整批全有全无。"""
+    idx, oid, data, qr = job
+    try:
+        png = render_label(data, qr)
+    except Exception as e:
+        raise HTTPException(500, f"第 {idx} 张（{oid}）标签渲染失败：{e}") from e
+    return "data:image/png;base64," + base64.b64encode(png).decode()
 

@@ -224,7 +224,12 @@ def render_label(data: LabelData, qr: Image.Image) -> bytes:
     img.paste(qr, (qr_x, qr_y))
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    # 32 色调色板 PNG：紫色/青色/黑/白 + 文字抗锯齿一共十几种颜色，32 色量化后
+    # 与 RGB 版肉眼无差（已比对样张），体积却只有 1/3（55KB → 19KB）。
+    # 一批 88 张 = 4.8MB → 1.6MB，现场 0.5MB/s 的带宽下这一条就是十几秒的差别。
+    img.convert("P", palette=Image.ADAPTIVE, colors=32, dither=Image.NONE).save(
+        buf, format="PNG"
+    )
     return buf.getvalue()
 
 
