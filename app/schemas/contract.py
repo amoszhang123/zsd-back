@@ -38,6 +38,17 @@ class ContractItemQuantityUpdate(BaseModel):
     quantity: int = Field(gt=0)
 
 
+class ContractAmountUpdate(BaseModel):
+    """合同总金额：要么人工填一个数，要么按明细重算。
+
+    total_amount 与 reset 二选一 —— reset 表示「按明细的含税金额重新汇总」并清掉
+    人工标记；只给 total_amount 表示人工填写，之后改数量也不会再覆盖它。
+    """
+
+    total_amount: float | None = Field(default=None, ge=0, le=1_000_000_000)
+    reset: bool = False
+
+
 class ContractStatusUpdate(BaseModel):
     """合同状态变更。用 Literal 挡掉非法取值（422），流转规则在路由里判。"""
 
@@ -83,6 +94,8 @@ class ContractSummary(BaseModel):
     phone: str = ""
     signed_at: date | None = None
     total_amount: float = 0.0
+    # True 表示总金额由人工填写，改明细数量时不会被自动重算覆盖
+    amount_manual: bool = False
     source_file: str = ""
     item_count: int = 0
     total_quantity: int = 0

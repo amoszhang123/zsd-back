@@ -20,6 +20,7 @@ from app.models.order import Order
 from app.models.production import WorkOrderItem
 from app.routers.orders import _build_steps
 from app.schemas.contract import (
+    ContractAmountUpdate,
     ContractDetail,
     ContractImport,
     ContractItemOut,
@@ -60,6 +61,7 @@ def _to_summary(
         phone=contract.phone,
         signed_at=contract.signed_at,
         total_amount=contract.total_amount,
+        amount_manual=contract.amount_manual,
         source_file=contract.source_file,
         item_count=len(contract.items),
         total_quantity=sum(item.quantity for item in contract.items),
@@ -301,7 +303,42 @@ def update_contract_item_quantity(
         if order:
             order.quantity = req.quantity
 
-    contract.total_amount = round(sum(i.amount for i in contract.items), 2)
+    # 人工填过总金额的合同不按明细重算，否则改一次数量就把手填的合同总额冲掉
+    if not contract.amount_manual:
+        contract.total_amount = round(sum(i.amount for i in contract.items), 2)
+
+    db.commit()
+    db.refresh(contract)
+    return _to_detail(db, contract, _locked_item_ids(db, contract))
+
+
+@router.patch("/{contract_id}/amount", response_model=ContractDetail)
+def update_contract_amount(
+    contract_id: str, req: ContractAmountUpdate, db: Session = Depends(get_db)
+):
+    """改合同总金额。
+
+    导入的 Excel 未必带单价，算出来的总金额常常是 0，实际合同额只能人工补。
+    人工填过之后 amount_manual=True，之后改明细数量不再按明细覆盖它；
+    传 reset=True 则按明细的含税金额重新汇总，并把标记清回自动。
+    """
+    contract = (
+        db.query(Contract)
+        .options(joinedload(Contract.items))
+        .filter(Contract.id == contract_id)
+        .first()
+    )
+    if not contract:
+        raise HTTPException(404, f"合同不存在: {contract_id}")
+
+    if req.reset:
+        contract.total_amount = round(sum(i.amount for i in contract.items), 2)
+        contract.amount_manual = False
+    elif req.total_amount is None:
+        raise HTTPException(400, "请提供 total_amount，或用 reset=true 按明细重算")
+    else:
+        contract.total_amount = round(req.total_amount, 2)
+        contract.amount_manual = True
 
     db.commit()
     db.refresh(contract)

@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Double, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Date, DateTime, Double, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.database import Base, TenantScoped
@@ -55,6 +55,10 @@ class Contract(TenantScoped, Base):
     # 只有约 7 位有效数字，196585.67 这类金额会失真。
     # 见 migrations/20261004_money_columns_double.sql
     total_amount: Mapped[float] = mapped_column(Double, default=0.0)
+    # 总金额是否由人工填写。导入的 Excel 常常没有单价（总金额算出来是 0），需要在
+    # 明细里直接填合同总额；填过之后就锁定这个值，改明细数量时不再按明细重算覆盖它。
+    # 想恢复自动汇总，在明细里点「按明细重算」即可清掉这个标记。
+    amount_manual: Mapped[bool] = mapped_column(Boolean, default=False)
     source_file: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
