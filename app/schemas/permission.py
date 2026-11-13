@@ -22,10 +22,14 @@ class PositionPermissions(BaseModel):
     # 里有哪些 key，只能给个标记让前端自己展开成完整清单。
     all_modules: bool
     modules: list[str]
+    # 该工种的在册员工数。预置工种即使一个人都没有也会列出，这个数用来解释
+    # 「为什么有个没人干的工种」：先配权限，后补员工。
+    employee_count: int = 0
 
 
 class PermissionConfigResponse(BaseModel):
-    # 只含 employees 表里实际存在、且非「管理员」的工种（管理员工种恒全可见，不可配）
+    # 员工在职工种 ∪ 已配置过的工种 ∪ 预置工种（操作工/质检/编程），去掉「管理员」
+    # ——管理员恒全可见、不可配，见 routers/permissions.py::_known_positions
     positions: list[PositionPermissions]
 
 

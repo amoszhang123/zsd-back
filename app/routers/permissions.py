@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -26,10 +27,30 @@ DEFAULT_VISIBLE: dict[str, list[str]] = {
     "编程": ["program", "production"],
 }
 
+# 车间的固定工种。页签如果只从 employees 表现取，员工还没录进系统时（生产库刚开
+# 账号就只有三个管理员）整个页面是空的、一个开关都没有，管理员会以为功能坏了。
+# 所以这几类工种无论有没有在职员工都列出来，先配好、后面加人直接生效。
+PRESET_POSITIONS: list[str] = list(DEFAULT_VISIBLE)
+
 
 def _known_positions(db: Session) -> list[str]:
-    rows = db.query(Employee.position).distinct().all()
-    return sorted(p for (p,) in rows if p and p != POSITION_ADMIN)
+    """权限管理页可配置的工种 = 员工在职工种 ∪ 已存过配置的工种 ∪ 预置工种，去掉管理员。"""
+    from_employees = {
+        p for (p,) in db.query(Employee.position).distinct().all() if p
+    }
+    configured = {
+        p for (p,) in db.query(PositionModulePermission.position).distinct().all() if p
+    }
+    positions = (from_employees | configured | set(PRESET_POSITIONS)) - {POSITION_ADMIN}
+    # 预置工种按固定顺序排在前面（操作工 → 质检 → 编程），其余按名称兜底排序。
+    # 直接 sorted 中文是按 unicode 码位排，页签顺序会看着莫名其妙。
+    preset = [p for p in PRESET_POSITIONS if p in positions]
+    return preset + sorted(positions - set(PRESET_POSITIONS))
+
+
+def _employee_counts(db: Session) -> dict[str, int]:
+    rows = db.query(Employee.position, func.count(Employee.id)).group_by(Employee.position).all()
+    return {p: n for p, n in rows if p}
 
 
 def _load(db: Session, position: str) -> tuple[bool, list[str]]:
@@ -63,12 +84,16 @@ def get_my_permissions(
 
 @router.get("/config", response_model=PermissionConfigResponse)
 def get_config(user: dict = Depends(require_admin), db: Session = Depends(get_db)):
+    counts = _employee_counts(db)
     positions = []
     for position in _known_positions(db):
         all_modules, modules = _load(db, position)
         positions.append(
             PositionPermissions(
-                position=position, all_modules=all_modules, modules=modules
+                position=position,
+                all_modules=all_modules,
+                modules=modules,
+                employee_count=counts.get(position, 0),
             )
         )
     return PermissionConfigResponse(positions=positions)
@@ -100,4 +125,5 @@ def update_position_modules(
         position=position,
         all_modules=False,
         modules=[k for k, v in visible.items() if v],
+        employee_count=_employee_counts(db).get(position, 0),
     )
