@@ -393,17 +393,75 @@ def get_shipment(shipment_id: int, db: Session = Depends(get_db)):
     return _to_out(shipment, _unit_price_map(db, [shipment]))
 
 
-@router.get("/{shipment_id}/print", response_class=HTMLResponse)
-def print_shipment(shipment_id: int, db: Session = Depends(get_db)):
-    """送货单打印页，只排 1 份内容。
+# 联次名称。2 联时没给「财务对账联」留位：补打/临时只要两张的场合，
+# 客户那份和厂里留底那份才是必须的，财务联可以后补。
+COPY_NAMES = {
+    2: ("客户签收联", "存根联"),
+    3: ("客户签收联", "财务对账联", "存根联"),
+    4: ("客户签收联", "财务对账联", "存根联", "附加联"),
+    5: ("客户签收联", "财务对账联", "存根联", "附加联一", "附加联二"),
+}
+COPY_CN_NUM = {2: "二", 3: "三", 4: "四", 5: "五"}
 
-    「一式三份」是打印机的份数参数，由操作员在打印对话框里自己设，不在页面里把
-    内容复制 3 遍来凑 —— 那样对话框里再设一次份数就会叠乘（3×3=9 张），存档成
-    PDF 也会莫名变成 3 页。
+_PRINT_CSS = """
+  @page { size: A4; margin: 12mm; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; font-size: 13px; }
+  .sheet { padding: 12px; page-break-after: always; break-after: page; }
+  /* 末联不再换页，否则打印机会多吐一张白纸出来 */
+  .sheet:last-child { page-break-after: auto; break-after: auto; }
+  .title-row { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 0 10px; }
+  .title { font-size: 17px; font-weight: 700; }
+  .copy-tag { font-size: 11px; color: #444; border: 1px solid #999; border-radius: 3px;
+              padding: 1px 6px; white-space: nowrap; }
+  .head-line { font-size: 13px; padding: 3px 0; }
+  .notice { font-size: 12px; color: #333; padding: 8px 0 6px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  th, td { border: 1px solid #000; padding: 5px 6px; font-size: 12px; text-align: center; }
+  th { background: #f2f2f2; font-weight: 700; }
+  td.num { text-align: right; }
+  .sign { display: flex; justify-content: space-between; margin-top: 28px; font-size: 13px; }
+  .sign div { width: 45%; }
+  .sign .line { border-bottom: 1px solid #000; height: 26px; }
+  /* 提示条只给屏幕看：纸上的每一联都不该多出一行给客户看的说明 */
+  .print-hint { background: #fff8e1; border: 1px solid #f0c36d; color: #8a5b00;
+                padding: 8px 10px; margin: 12px 12px 0; font-size: 12px; border-radius: 4px; }
+  @media screen {
+    body { background: #eef1f5; padding-bottom: 16px; }
+    .sheet { background: #fff; max-width: 186mm; margin: 10px auto 0;
+             box-shadow: 0 1px 8px rgba(0, 0, 0, .16); }
+  }
+  @media print { .print-hint { display: none; } }
+"""
+
+
+def _copy_labels(n: int) -> list:
+    """第 1..n 联各叫什么。单联不标注——只有一张纸时没有「哪一联」的问题。"""
+    if n <= 1:
+        return [""]
+    return list(COPY_NAMES.get(n, COPY_NAMES[5]))
+
+
+@router.get("/{shipment_id}/print", response_class=HTMLResponse)
+def print_shipment(shipment_id: int, copies: int = 3, db: Session = Depends(get_db)):
+    """送货单打印页：按联数把同一份内容排成 N 页，一联一页。
+
+    为什么在页面里排 N 页，而不是靠打印对话框的「份数」：
+      - window.print() 不带参数，对话框里的「份数」是浏览器自己的控件，页面既读不到
+        也设不了——「默认打 3 份」在 Web 上根本没有对应 API；
+      - 靠操作员每次手填 3，就会漏（原本正是这样漏的）；
+      - 所以把「份数」变成文档的一部分：3 联 = 3 页，对话框显示「3 张纸」，无需记忆。
+    代价是对话框份数必须保持 1，否则叠乘（3×3=9 张）。页面顶部因此有一条只在屏幕上
+    出现的提示条，@media print 隐藏，纸上不留痕；再借对话框的页数自证。
+
+    联数超出 1–5 时静默夹紧，不报 422：现场不该因为多敲一个数就看不到单据。
     """
     shipment = db.query(Shipment).filter(Shipment.id == shipment_id).first()
     if not shipment:
         raise HTTPException(404, f"出货记录单不存在: #{shipment_id}")
+
+    n = max(1, min(5, copies))
+    labels = _copy_labels(n)
 
     items = sorted(shipment.items, key=lambda i: i.seq)
     today = date.today()
@@ -414,52 +472,54 @@ def print_shipment(shipment_id: int, db: Session = Depends(get_db)):
         f"<td>{i.remark}</td></tr>"
         for i in items
     )
+    # 单联时不写「一式一份」，那句话在只有一张纸时是废话
+    copies_note = f"&nbsp;&nbsp;一式{COPY_CN_NUM[n]}份" if n > 1 else ""
 
-    sheet_html = f"""  <div class="title">{shipment.ship_from}({shipment.doc_no}){printed_on}</div>
-  <div class="head-line">收件公司：{shipment.party_a}</div>
-  <div class="head-line">地址：{shipment.address}</div>
-  <div class="head-line">采购单号：{shipment.purchase_no}</div>
-  <div class="head-line">项目号：{shipment.project_no}</div>
-  <div class="notice">以下明细由收件方签字确认后，默认已收货&nbsp;&nbsp;一式三份</div>
-  <table>
-    <thead>
-      <tr><th style="width:7%">序号</th><th style="width:13%">物料号</th><th style="width:18%">品名</th>
-      <th style="width:26%">规格/型号</th><th style="width:10%">用量</th><th style="width:9%">单位</th>
-      <th style="width:17%">备注</th></tr>
-    </thead>
-    <tbody>{rows_html}</tbody>
-  </table>
-  <div class="sign">
-    <div>送货人：<div class="line"></div></div>
-    <div>收件方签字：<div class="line"></div></div>
-  </div>"""
+    sheets = []
+    for idx, label in enumerate(labels, start=1):
+        tag_html = f'<div class="copy-tag">{label} {idx}/{n}</div>' if label else ""
+        sheets.append(f"""  <div class="sheet">
+    <div class="title-row">
+      <div class="title">{shipment.ship_from}({shipment.doc_no}){printed_on}</div>
+      {tag_html}
+    </div>
+    <div class="head-line">收件公司：{shipment.party_a}</div>
+    <div class="head-line">地址：{shipment.address}</div>
+    <div class="head-line">采购单号：{shipment.purchase_no}</div>
+    <div class="head-line">项目号：{shipment.project_no}</div>
+    <div class="notice">以下明细由收件方签字确认后，默认已收货{copies_note}</div>
+    <table>
+      <thead>
+        <tr><th style="width:7%">序号</th><th style="width:13%">物料号</th><th style="width:18%">品名</th>
+        <th style="width:26%">规格/型号</th><th style="width:10%">用量</th><th style="width:9%">单位</th>
+        <th style="width:17%">备注</th></tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    <div class="sign">
+      <div>送货人：<div class="line"></div></div>
+      <div>收件方签字：<div class="line"></div></div>
+    </div>
+  </div>""")
+
+    hint = ""
+    if n > 1:
+        hint = (
+            f'<div class="print-hint">本页已含 {n} 联（{" / ".join(labels)}）。'
+            f"打印对话框里的「份数」请保持 <strong>1</strong>，"
+            f"否则会叠乘成 {n} 倍的纸。</div>"
+        )
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>送货单 — {shipment.doc_no}</title>
-<style>
-  @page {{ size: A4; margin: 12mm; }}
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ font-family: "Microsoft YaHei", "PingFang SC", sans-serif; font-size: 13px; }}
-  .sheet {{ padding: 12px; }}
-  .title {{ font-size: 17px; font-weight: 700; padding: 6px 0 10px; }}
-  .head-line {{ font-size: 13px; padding: 3px 0; }}
-  .notice {{ font-size: 12px; color: #333; padding: 8px 0 6px; }}
-  table {{ width: 100%; border-collapse: collapse; margin-top: 4px; }}
-  th, td {{ border: 1px solid #000; padding: 5px 6px; font-size: 12px; text-align: center; }}
-  th {{ background: #f2f2f2; font-weight: 700; }}
-  td.num {{ text-align: right; }}
-  .sign {{ display: flex; justify-content: space-between; margin-top: 28px; font-size: 13px; }}
-  .sign div {{ width: 45%; }}
-  .sign .line {{ border-bottom: 1px solid #000; height: 26px; }}
-</style>
+<title>送货单 — {shipment.doc_no}（{n}联）</title>
+<style>{_PRINT_CSS}</style>
 </head>
 <body>
-  <div class="sheet">
-{sheet_html}
-  </div>
+{hint}
+{"".join(sheets)}
 </body>
 </html>"""
     return HTMLResponse(content=html)
