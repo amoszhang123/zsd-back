@@ -413,14 +413,6 @@ def update_ship_date(shipment_id: int, payload: ShipmentDateUpdate, db: Session 
     return _to_out(shipment, _unit_price_map(db, [shipment]))
 
 
-# 联次名称。2 联时没给「财务对账联」留位：补打/临时只要两张的场合，
-# 客户那份和厂里留底那份才是必须的，财务联可以后补。
-COPY_NAMES = {
-    2: ("客户签收联", "存根联"),
-    3: ("客户签收联", "财务对账联", "存根联"),
-    4: ("客户签收联", "财务对账联", "存根联", "附加联"),
-    5: ("客户签收联", "财务对账联", "存根联", "附加联一", "附加联二"),
-}
 COPY_CN_NUM = {2: "二", 3: "三", 4: "四", 5: "五"}
 
 _PRINT_CSS = """
@@ -428,12 +420,9 @@ _PRINT_CSS = """
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; font-size: 13px; }
   .sheet { padding: 12px; page-break-after: always; break-after: page; }
-  /* 末联不再换页，否则打印机会多吐一张白纸出来 */
+  /* 最后一页不再换页，否则打印机会多吐一张白纸出来 */
   .sheet:last-child { page-break-after: auto; break-after: auto; }
-  .title-row { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 0 10px; }
-  .title { font-size: 17px; font-weight: 700; }
-  .copy-tag { font-size: 11px; color: #444; border: 1px solid #999; border-radius: 3px;
-              padding: 1px 6px; white-space: nowrap; }
+  .title { font-size: 17px; font-weight: 700; padding: 6px 0 10px; }
   .head-line { font-size: 13px; padding: 3px 0; }
   .notice { font-size: 12px; color: #333; padding: 8px 0 6px; }
   table { width: 100%; border-collapse: collapse; margin-top: 4px; }
@@ -443,7 +432,7 @@ _PRINT_CSS = """
   .sign { display: flex; justify-content: space-between; margin-top: 28px; font-size: 13px; }
   .sign div { width: 45%; }
   .sign .line { border-bottom: 1px solid #000; height: 26px; }
-  /* 提示条只给屏幕看：纸上的每一联都不该多出一行给客户看的说明 */
+  /* 提示条只给屏幕看：纸上不该多出一行给客户看的说明 */
   .print-hint { background: #fff8e1; border: 1px solid #f0c36d; color: #8a5b00;
                 padding: 8px 10px; margin: 12px 12px 0; font-size: 12px; border-radius: 4px; }
   @media screen {
@@ -455,33 +444,28 @@ _PRINT_CSS = """
 """
 
 
-def _copy_labels(n: int) -> list:
-    """第 1..n 联各叫什么。单联不标注——只有一张纸时没有「哪一联」的问题。"""
-    if n <= 1:
-        return [""]
-    return list(COPY_NAMES.get(n, COPY_NAMES[5]))
-
-
 @router.get("/{shipment_id}/print", response_class=HTMLResponse)
 def print_shipment(shipment_id: int, copies: int = 3, db: Session = Depends(get_db)):
-    """送货单打印页：按联数把同一份内容排成 N 页，一联一页。
+    """送货单打印页：把同一份内容重复排成 N 页，一页一张。
 
     为什么在页面里排 N 页，而不是靠打印对话框的「份数」：
       - window.print() 不带参数，对话框里的「份数」是浏览器自己的控件，页面既读不到
         也设不了——「默认打 3 份」在 Web 上根本没有对应 API；
       - 靠操作员每次手填 3，就会漏（原本正是这样漏的）；
-      - 所以把「份数」变成文档的一部分：3 联 = 3 页，对话框显示「3 张纸」，无需记忆。
+      - 所以把「份数」变成文档的一部分：3 份 = 3 页，对话框显示「3 张纸」，无需记忆。
     代价是对话框份数必须保持 1，否则叠乘（3×3=9 张）。页面顶部因此有一条只在屏幕上
     出现的提示条，@media print 隐藏，纸上不留痕；再借对话框的页数自证。
 
-    联数超出 1–5 时静默夹紧，不报 422：现场不该因为多敲一个数就看不到单据。
+    页面上不标「客户签收联 / 财务对账联 / 存根联」这类联次：几张纸内容完全一样，
+    标了反而要额外解释谁拿哪张。要区分拿谁的那张，靠人工分开即可。
+
+    份数超出 1–5 时静默夹紧，不报 422：现场不该因为多敲一个数就看不到单据。
     """
     shipment = db.query(Shipment).filter(Shipment.id == shipment_id).first()
     if not shipment:
         raise HTTPException(404, f"出货记录单不存在: #{shipment_id}")
 
     n = max(1, min(5, copies))
-    labels = _copy_labels(n)
 
     items = sorted(shipment.items, key=lambda i: i.seq)
     # 抬头日期取这张单的出货日期，不是打印当天 —— 否则昨天开的单今天补打，
@@ -494,17 +478,13 @@ def print_shipment(shipment_id: int, copies: int = 3, db: Session = Depends(get_
         f"<td>{i.remark}</td></tr>"
         for i in items
     )
-    # 单联时不写「一式一份」，那句话在只有一张纸时是废话
+    # 只打 1 张时不写「一式一份」，那句话在只有一张纸时是废话
     copies_note = f"&nbsp;&nbsp;一式{COPY_CN_NUM[n]}份" if n > 1 else ""
 
-    sheets = []
-    for idx, label in enumerate(labels, start=1):
-        tag_html = f'<div class="copy-tag">{label} {idx}/{n}</div>' if label else ""
-        sheets.append(f"""  <div class="sheet">
-    <div class="title-row">
-      <div class="title">{shipment.ship_from}({shipment.doc_no}){printed_on}</div>
-      {tag_html}
-    </div>
+    # 每页内容完全相同，不标「客户签收联」之类的联次：现场一份份撕下来就是三张一样的单，
+    # 标了反而要多解释谁该拿哪张。
+    sheet_html = f"""  <div class="sheet">
+    <div class="title">{shipment.ship_from}({shipment.doc_no}){printed_on}</div>
     <div class="head-line">收件公司：{shipment.party_a}</div>
     <div class="head-line">地址：{shipment.address}</div>
     <div class="head-line">采购单号：{shipment.purchase_no}</div>
@@ -522,26 +502,30 @@ def print_shipment(shipment_id: int, copies: int = 3, db: Session = Depends(get_
       <div>送货人：<div class="line"></div></div>
       <div>收件方签字：<div class="line"></div></div>
     </div>
-  </div>""")
+  </div>"""
+    sheets = sheet_html * n
 
     hint = ""
     if n > 1:
         hint = (
-            f'<div class="print-hint">本页已含 {n} 联（{" / ".join(labels)}）。'
+            f'<div class="print-hint">本页已含 <strong>{n}</strong> 张内容相同的送货单。'
             f"打印对话框里的「份数」请保持 <strong>1</strong>，"
             f"否则会叠乘成 {n} 倍的纸。</div>"
         )
+
+    # 打印预览标题与 PDF 默认文件名都取 <title>，带上页数便于存档时一眼认出
+    title_suffix = f"（{n}页）" if n > 1 else ""
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>送货单 — {shipment.doc_no}（{n}联）</title>
+<title>送货单 — {shipment.doc_no}{title_suffix}</title>
 <style>{_PRINT_CSS}</style>
 </head>
 <body>
 {hint}
-{"".join(sheets)}
+{sheets}
 </body>
 </html>"""
     return HTMLResponse(content=html)
