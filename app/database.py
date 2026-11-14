@@ -161,6 +161,21 @@ def init_db():
 
         logging.getLogger(__name__).exception("出货完结状态回填失败，不影响启动")
 
+    # ship_date 是后加的列：之前开出的送货单要按开单当天补上出货日期，
+    # 否则 _to_out 每次都得回落到 created_at，改过的和没改过的在库里分不清。
+    try:
+        from app.models.shipment import backfill_ship_date
+
+        filled = backfill_ship_date()
+        if filled:
+            import logging
+
+            logging.getLogger(__name__).info("出货日期回填：%s 张送货单", filled)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("出货日期回填失败，不影响启动")
+
 
 def _column_ddl(table: str, col) -> str:
     """把模型上的一列渲染成 MySQL 的 ADD COLUMN 语句。

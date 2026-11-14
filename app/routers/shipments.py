@@ -21,6 +21,7 @@ from app.schemas.shipment import (
     ContractOrderOut,
     ContractProgressOut,
     ShipmentCreate,
+    ShipmentDateUpdate,
     ShipmentItemOut,
     ShipmentOut,
 )
@@ -145,6 +146,7 @@ def _to_out(shipment: Shipment, prices: dict[str, float]) -> ShipmentOut:
         purchase_no=shipment.purchase_no,
         ship_from=shipment.ship_from,
         created_at=shipment.created_at,
+        ship_date=shipment.ship_date or shipment.created_at.date(),
         item_count=len(shipment.items),
         total_quantity=sum(i.quantity for i in shipment.items),
         total_amount=round(total_amount, 2),
@@ -318,6 +320,7 @@ def create_shipment(req: ShipmentCreate, db: Session = Depends(get_db)):
             address=address,
             purchase_no=contract.purchase_no,
             ship_from=settings.ship_from_company,
+            ship_date=date.today(),
             qc_override=bool(override_note),
             qc_override_note=override_note,
         )
@@ -393,6 +396,23 @@ def get_shipment(shipment_id: int, db: Session = Depends(get_db)):
     return _to_out(shipment, _unit_price_map(db, [shipment]))
 
 
+@router.patch("/{shipment_id}/ship-date", response_model=ShipmentOut)
+def update_ship_date(shipment_id: int, payload: ShipmentDateUpdate, db: Session = Depends(get_db)):
+    """改送货单抬头的出货日期。
+
+    只动 ship_date，不碰 doc_no —— 单号里的 yyyymmdd 还带着当日流水，改了会撞号，
+    客户和财务手上的单号也会对不上。所以两者从此允许不一致，这是刻意接受的。
+    日期本身的合法性（含 2 月 30 日这类）由 pydantic 的 date 类型挡在入口。
+    """
+    shipment = db.query(Shipment).filter(Shipment.id == shipment_id).first()
+    if not shipment:
+        raise HTTPException(404, f"出货记录单不存在: #{shipment_id}")
+    shipment.ship_date = payload.ship_date
+    db.commit()
+    db.refresh(shipment)
+    return _to_out(shipment, _unit_price_map(db, [shipment]))
+
+
 # 联次名称。2 联时没给「财务对账联」留位：补打/临时只要两张的场合，
 # 客户那份和厂里留底那份才是必须的，财务联可以后补。
 COPY_NAMES = {
@@ -464,8 +484,10 @@ def print_shipment(shipment_id: int, copies: int = 3, db: Session = Depends(get_
     labels = _copy_labels(n)
 
     items = sorted(shipment.items, key=lambda i: i.seq)
-    today = date.today()
-    printed_on = f"{today.month}/{today.day}"
+    # 抬头日期取这张单的出货日期，不是打印当天 —— 否则昨天开的单今天补打，
+    # 纸上就变成今天，跟单号里写死的开单日期对不上。
+    ship_day = shipment.ship_date or shipment.created_at.date()
+    printed_on = f"{ship_day.month}/{ship_day.day}"
     rows_html = "".join(
         f"<tr><td>{i.seq}</td><td>{i.material_no}</td><td>{i.product}</td>"
         f"<td>{i.model}</td><td class='num'>{i.quantity}</td><td>{i.unit}</td>"

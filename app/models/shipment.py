@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.database import Base
@@ -26,6 +26,12 @@ class Shipment(Base):
     purchase_no: Mapped[str] = mapped_column(String(50), default="")
     ship_from: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    # 送货单抬头印的那个日期（月/日）。默认 = 开单当天，允许人工改 —— 补打历史单时
+    # 抬头不该变成「打印当天」，那样和单号里写死的开单日期对不上。
+    # 与 doc_no 的关系：doc_no 的 yyyymmdd 是开单基准（还带着当日流水号），
+    # 改 ship_date 不会也不能改单号，两者从此允许不一致。
+    # 可空：给 ensure_schema 留出「补列不锁表」的空间，存量行由 backfill_ship_date 补。
+    ship_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     # 这张送货单是在「历史补偿模式」下、绕过终检开出来的。只做内部追溯，
     # 不打印在送货单上 —— 客户不需要知道我们内部跳过了哪道工序。
     qc_override: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -145,6 +151,31 @@ def backfill_fulfilled() -> int:
                 WHERE os.step_key = 'shipping'
                   AND o.fulfilled_at IS NOT NULL
                   AND os.status <> 'completed'
+                """
+            )
+        )
+    return result.rowcount or 0
+
+
+def backfill_ship_date() -> int:
+    """给 ship_date 列出现之前开出的送货单补上出货日期。
+
+    补的值是开单当天，也就是这些单当初打印时抬头印的那个日期 —— 那时候抬头取的是
+    「打印当天」，只要没补打就正好等于开单日。
+
+    幂等：只填 ship_date 为空的行；补过的不再动，多 worker 同时启动也不会互相踩。
+    """
+    from sqlalchemy import text
+
+    from app.database import engine
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                UPDATE shipments
+                SET ship_date = DATE(created_at)
+                WHERE ship_date IS NULL
                 """
             )
         )

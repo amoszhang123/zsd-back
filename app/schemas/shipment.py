@@ -37,6 +37,12 @@ class ShipmentItemOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ShipmentDateUpdate(BaseModel):
+    """改送货单抬头的出货日期（补打历史单用）。"""
+
+    ship_date: date
+
+
 class ShipmentOut(BaseModel):
     id: int
     doc_no: str
@@ -47,6 +53,8 @@ class ShipmentOut(BaseModel):
     purchase_no: str = ""
     ship_from: str = ""
     created_at: datetime
+    # 抬头印的出货日期；库里为空时由 _to_out 回落到开单当天，所以这里不会是 None
+    ship_date: date
     item_count: int = 0
     total_quantity: int = 0
     total_amount: float = 0.0
