@@ -2,7 +2,7 @@ from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -90,15 +90,28 @@ def _shipped_doc_map(db: Session, contract_id: str) -> dict[str, str]:
 
 
 def _next_doc_no(db: Session, day: date) -> str:
+    """生成单号：ZSD + 出货日期(yyyymmdd) + 当天第几张。
+
+    序号取「当天已有的最大序号 + 1」，并对该日的单号区间加锁 —— 两个人同时点出货
+    时排队拿号，而不是各自数到同一个数再撞唯一索引（撞了就是 500，一张单都没生成）。
+    两位序号用满 99 之后自然进位成三位（101），历史单不会被改成 001。
+
+    参数 day 是**出货日期**（可以人工指定），不是服务器当天：补录 11-13 的单，
+    单号里就该是 20261113，与抬头印的日期一致，也和财务手上的纸对得上。
+    """
     prefix = f"{DOC_PREFIX}{day.strftime('%Y%m%d')}"
-    seq = (
-        db.query(func.count(Shipment.id)).filter(Shipment.doc_no.like(f"{prefix}%")).scalar() or 0
-    ) + 1
-    candidate = f"{prefix}{seq:02d}"
-    while db.query(Shipment.id).filter(Shipment.doc_no == candidate).first():
-        seq += 1
-        candidate = f"{prefix}{seq:02d}"
-    return candidate
+    # FOR UPDATE 锁住这天已存在的行；InnoDB 的间隙锁同时拦住并发插入同前缀的新行
+    existing = db.execute(
+        text("SELECT doc_no FROM shipments WHERE doc_no LIKE :p FOR UPDATE"),
+        {"p": f"{prefix}%"},
+    ).scalars().all()
+
+    seq = 0
+    for doc_no in existing:
+        tail = doc_no[len(prefix) :]
+        if tail.isdigit():
+            seq = max(seq, int(tail))
+    return f"{prefix}{seq + 1:02d}"
 
 
 def _unit_price_map(db: Session, shipments: list[Shipment]) -> dict[str, float]:
@@ -330,6 +343,10 @@ def create_shipment(req: ShipmentCreate, db: Session = Depends(get_db)):
     if not address:
         raise HTTPException(400, "收货地址不能为空")
 
+    # 出货日期决定单号里那串 yyyymmdd：补录历史单时前端直接传过来，不传就是今天。
+    # 同一批拆成多张单时共用这个日期，序号靠 _next_doc_no 依次往后排。
+    ship_day = req.ship_date or date.today()
+
     created = []
     for project_no, entries in groups.items():
         # 放行说明按单张送货单各自记：这张单里错了哪几张，就写哪几张。
@@ -343,14 +360,14 @@ def create_shipment(req: ShipmentCreate, db: Session = Depends(get_db)):
             ]
         )
         shipment = Shipment(
-            doc_no=_next_doc_no(db, date.today()),
+            doc_no=_next_doc_no(db, ship_day),
             contract_id=contract.id,
             project_no=project_no,
             party_a=contract.party_a,
             address=address,
             purchase_no=contract.purchase_no,
             ship_from=settings.ship_from_company,
-            ship_date=date.today(),
+            ship_date=ship_day,
             qc_override=bool(override_note),
             qc_override_note=override_note,
         )
@@ -428,16 +445,25 @@ def get_shipment(shipment_id: int, db: Session = Depends(get_db)):
 
 @router.patch("/{shipment_id}/ship-date", response_model=ShipmentOut)
 def update_ship_date(shipment_id: int, payload: ShipmentDateUpdate, db: Session = Depends(get_db)):
-    """改送货单抬头的出货日期。
+    """改送货单的出货日期，并按新日期重编单号。
 
-    只动 ship_date，不碰 doc_no —— 单号里的 yyyymmdd 还带着当日流水，改了会撞号，
-    客户和财务手上的单号也会对不上。所以两者从此允许不一致，这是刻意接受的。
-    日期本身的合法性（含 2 月 30 日这类）由 pydantic 的 date 类型挡在入口。
+    单号规则是「ZSD + 出货日期 + 当天第几张」，所以日期一动，单号必须跟着动 ——
+    否则抬头印 11/19、单号却写着 1115，财务对账时一定被问住。
+
+    重编的位置是「目标日期当天末尾」：取该日最大序号 +1，不重排同日的其他单。
+    重排会把跟这次操作无关的、可能已经打印给客户的单号一起改掉，代价太大；
+    留个空号对账没有任何影响。
+
+    日期没变时不动单号：操作员手滑连点两次保存，序号不该往后跳一位。
     """
     shipment = db.query(Shipment).filter(Shipment.id == shipment_id).first()
     if not shipment:
         raise HTTPException(404, f"出货记录单不存在: #{shipment_id}")
+
+    changed = shipment.ship_date != payload.ship_date
     shipment.ship_date = payload.ship_date
+    if changed:
+        shipment.doc_no = _next_doc_no(db, payload.ship_date)
     db.commit()
     db.refresh(shipment)
     return _to_out(shipment, _unit_price_map(db, [shipment]))

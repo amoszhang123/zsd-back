@@ -14,6 +14,9 @@ class ShipmentCreate(BaseModel):
     contract_id: str
     address: str = Field(min_length=1)
     items: list[ShipmentItemIn] = Field(min_length=1)
+    # 出货日期。决定单号里的 yyyymmdd 与抬头印的日期：补录历史单时前端直接带上，
+    # 不传就是今天。允许未来日期（先开单后发货的场合确实存在）。
+    ship_date: date | None = None
     # 历史补偿：允许未终检（或终检判定返工/报废/维修）的工单出货。
     # 前端的「历史补偿模式」开关只是把这个人肉动作显式化，最终必须由这里放行，
     # 否则接口仍按老规则一律 400。

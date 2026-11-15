@@ -26,10 +26,9 @@ class Shipment(Base):
     purchase_no: Mapped[str] = mapped_column(String(50), default="")
     ship_from: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
-    # 送货单抬头印的那个日期（月/日）。默认 = 开单当天，允许人工改 —— 补打历史单时
-    # 抬头不该变成「打印当天」，那样和单号里写死的开单日期对不上。
-    # 与 doc_no 的关系：doc_no 的 yyyymmdd 是开单基准（还带着当日流水号），
-    # 改 ship_date 不会也不能改单号，两者从此允许不一致。
+    # 送货单的出货日期：抬头印「月/日」，同时决定单号里的 yyyymmdd。默认 = 开单当天，
+    # 允许人工改（补录历史单）；改了日期，doc_no 会按新日期重编（见 update_ship_date）。
+    # 两者的关系是「单号跟着出货日期走」，不再允许长期不一致。
     # 可空：给 ensure_schema 留出「补列不锁表」的空间，存量行由 backfill_ship_date 补。
     ship_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     # 这张送货单是在「历史补偿模式」下、绕过终检开出来的。只做内部追溯，
