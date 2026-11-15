@@ -472,18 +472,30 @@ def update_ship_date(shipment_id: int, payload: ShipmentDateUpdate, db: Session 
 COPY_CN_NUM = {2: "二", 3: "三", 4: "四", 5: "五"}
 
 _PRINT_CSS = """
-  @page { size: A4; margin: 12mm; }
+  /* A4 纵向，左右边距 6mm（原 12mm）：型号最长 29 字符，纵向只有把左右压到 6mm
+     才排得下一行。上下仍留 12mm，别把表头顶到纸边上。
+     6mm 是给打印机不可打印区留的余量（普通激光机 4~5mm），再小会切到边框。 */
+  @page { size: A4; margin: 12mm 6mm; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; font-size: 13px; }
-  .sheet { padding: 12px; page-break-after: always; break-after: page; }
+  /* 纸张留白只由 @page（打印）和下面的 @media screen 负责，这里再加 padding 会让
+     纸上实际边距变成 6mm+3.2mm，左右和上下就不齐了 */
+  .sheet { page-break-after: always; break-after: page; }
   /* 最后一页不再换页，否则打印机会多吐一张白纸出来 */
   .sheet:last-child { page-break-after: auto; break-after: auto; }
   .title { font-size: 17px; font-weight: 700; padding: 6px 0 10px; }
   .head-line { font-size: 13px; padding: 3px 0; }
   .notice { font-size: 12px; color: #333; padding: 8px 0 6px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  /* fixed 布局：百分比才是铁律。auto 布局下长型号会把列撑宽、整张表顶出版心被裁掉 */
+  table { width: 100%; border-collapse: collapse; margin-top: 4px; table-layout: fixed; }
+  /* 续页自动重复表头：46 行的大单第二张纸也有列名 */
+  thead { display: table-header-group; }
   th, td { border: 1px solid #000; padding: 5px 6px; font-size: 12px; text-align: center; }
-  th { background: #f2f2f2; font-weight: 700; }
+  th { background: #f2f2f2; font-weight: 700; white-space: nowrap; }
+  /* 短字段永远一行。品名/规格/备注故意不加 nowrap：真超长时让那**一格**自己折行
+     （型号按连字符断，中文按字断），而不是把字挤到隔壁格里盖住用量。
+     列序见 sheet_html：1 序号 2 物料号 3 品名 4 规格 5 用量 6 单位 7 备注 */
+  td:nth-child(1), td:nth-child(2), td:nth-child(5), td:nth-child(6) { white-space: nowrap; }
   td.num { text-align: right; }
   .sign { display: flex; justify-content: space-between; margin-top: 28px; font-size: 13px; }
   .sign div { width: 45%; }
@@ -491,9 +503,11 @@ _PRINT_CSS = """
   /* 提示条只给屏幕看：纸上不该多出一行给客户看的说明 */
   .print-hint { background: #fff8e1; border: 1px solid #f0c36d; color: #8a5b00;
                 padding: 8px 10px; margin: 12px 12px 0; font-size: 12px; border-radius: 4px; }
+  /* 屏幕上的白纸要和 A4 完全一致：宽 210mm、内边距 12mm/6mm，
+     这样屏幕看到哪里换行，纸上就是哪里换行 */
   @media screen {
     body { background: #eef1f5; padding-bottom: 16px; }
-    .sheet { background: #fff; max-width: 186mm; margin: 10px auto 0;
+    .sheet { background: #fff; width: 210mm; padding: 12mm 6mm; margin: 10px auto 0;
              box-shadow: 0 1px 8px rgba(0, 0, 0, .16); }
   }
   @media print { .print-hint { display: none; } }
@@ -548,9 +562,15 @@ def print_shipment(shipment_id: int, copies: int = 3, db: Session = Depends(get_
     <div class="notice">以下明细由收件方签字确认后，默认已收货{copies_note}</div>
     <table>
       <thead>
-        <tr><th style="width:7%">序号</th><th style="width:13%">物料号</th><th style="width:18%">品名</th>
-        <th style="width:26%">规格/型号</th><th style="width:10%">用量</th><th style="width:9%">单位</th>
-        <th style="width:17%">备注</th></tr>
+        <!-- 列宽按「12px 微软雅黑下的实际文字宽度 + 单元格 padding」反推，不是拍的百分比。
+             版心 = A4 210mm - 左右 6mm = 198mm ≈ 748px：
+               序号 6%=45  物料号 10%=75（8 位数字 55px）  品名 17%=127（9 汉字 108px）
+               规格/型号 44%=329（29 字符 243px，余量 74px ≈ 能再长 9 个字符）
+               用量 6%=45  单位 6%=45（PCS 27px）  备注 11%=82（5 汉字）
+             改列宽前先量这条单里最长的型号：`SELECT MAX(CHAR_LENGTH(model)) FROM orders` -->
+        <tr><th style="width:6%">序号</th><th style="width:10%">物料号</th><th style="width:17%">品名</th>
+        <th style="width:44%">规格/型号</th><th style="width:6%">用量</th><th style="width:6%">单位</th>
+        <th style="width:11%">备注</th></tr>
       </thead>
       <tbody>{rows_html}</tbody>
     </table>
