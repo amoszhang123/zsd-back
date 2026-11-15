@@ -242,6 +242,32 @@ def list_contract_orders(contract_id: str, db: Session = Depends(get_db)):
     return out
 
 
+NOTE_LIMIT = 480  # shipments.qc_override_note 是 varchar(500)，留 20 字符余量
+
+
+def _override_note(pairs: list[tuple[str, str]]) -> str:
+    """把「哪几张工单因为什么被放行」压成一句能塞进 varchar(500) 的话。
+
+    不能逐张列：一张送货单可能一次补上百张历史单，`WO17972AA 未终检、` 这种写法
+    重复 101 次就是 1400 多字符，MySQL 严格模式直接 1406 Data too long，整个出货
+    事务回滚 —— 前端只看到 500，单子一张都没生成。这里按终检结论分组计数，每组
+    只列前 3 个单号；具体哪几张被放行，shipment_items 里逐行都有，随时能反查。
+    """
+    if not pairs:
+        return ""
+    by_verdict: dict[str, list[str]] = {}
+    for order_id, verdict in pairs:
+        by_verdict.setdefault(verdict or "未终检", []).append(order_id)
+
+    parts = []
+    for verdict, order_ids in by_verdict.items():
+        head = "、".join(order_ids[:3])
+        tail = " 等" if len(order_ids) > 3 else ""
+        parts.append(f"{verdict} {len(order_ids)} 张（{head}{tail}）")
+    note = "；".join(parts)
+    return note if len(note) <= NOTE_LIMIT else note[: NOTE_LIMIT - 1] + "…"
+
+
 @router.post("", response_model=list[ShipmentOut])
 def create_shipment(req: ShipmentCreate, db: Session = Depends(get_db)):
     contract = db.query(Contract).filter(Contract.id == req.contract_id).first()
@@ -306,11 +332,15 @@ def create_shipment(req: ShipmentCreate, db: Session = Depends(get_db)):
 
     created = []
     for project_no, entries in groups.items():
-        # 放行说明按单张送货单各自记：这张单里错了哪几张，就写哪几张
-        override_note = "、".join(
-            f"{entry.order_id} {override_reason[entry.order_id]}"
-            for entry, _ in entries
-            if entry.order_id in override_reason
+        # 放行说明按单张送货单各自记：这张单里错了哪几张，就写哪几张。
+        # 用压缩后的描述而不是逐张罗列 —— 逐张列会超出列宽把整批出货炸掉，
+        # 详见 _override_note 的注释。
+        override_note = _override_note(
+            [
+                (entry.order_id, override_reason[entry.order_id])
+                for entry, _ in entries
+                if entry.order_id in override_reason
+            ]
         )
         shipment = Shipment(
             doc_no=_next_doc_no(db, date.today()),
