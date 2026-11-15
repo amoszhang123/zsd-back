@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
@@ -25,6 +25,7 @@ from app.schemas.shipment import (
     ShipmentItemOut,
     ShipmentOut,
 )
+from app.statement import render_statement
 
 router = APIRouter(prefix="/api/shipments", tags=["shipments"])
 
@@ -605,3 +606,143 @@ def print_shipment(shipment_id: int, copies: int = 3, db: Session = Depends(get_
 </body>
 </html>"""
     return HTMLResponse(content=html)
+
+
+def _short_customer(name: str) -> str:
+    """客户简称，给对账单文件名用：苏州泰松智能科技有限公司 → 苏州泰松。
+
+    只取前 4 个字符，不去猜「科技/智能/精密」这些词该怎么剥 —— 猜错了文件名
+    比长一点更难受。用户可以自己改。
+    """
+    text = (name or "").replace(" ", "").strip()
+    return text[:4] if text else "客户"
+
+
+def _statement_rows(db: Session, shipments: list[Shipment]) -> list[dict]:
+    """把若干张送货单的明细摊平成对账单的行。
+
+    不合并同一工单的多次出货：对账要能一行行对回送货单，合并了就查不出差异。
+    单价和品牌只有合同明细（contract_items）有，按「工单 + 项目号」取，取不到
+    再退回只按工单取 —— 同一工单在多份合同里重号时，前者才对。
+    """
+    ids = [s.id for s in shipments]
+    if not ids:
+        return []
+    pairs = (
+        db.query(ShipmentItem, Order)
+        .outerjoin(Order, Order.id == ShipmentItem.order_id)
+        .filter(ShipmentItem.shipment_id.in_(ids))
+        .all()
+    )
+    order_ids = sorted({item.order_id for item, _ in pairs if item.order_id})
+    by_project: dict[tuple[str, str], tuple[str, float]] = {}
+    by_order: dict[str, tuple[str, float]] = {}
+    if order_ids:
+        for ci in db.query(ContractItem).filter(ContractItem.order_id.in_(order_ids)).all():
+            value = (ci.brand or "", ci.unit_price or 0.0)
+            by_project.setdefault((ci.order_id, ci.project_no or ""), value)
+            by_order.setdefault(ci.order_id, value)
+
+    grouped: dict[int, list[ShipmentItem]] = {}
+    for item, _order in pairs:
+        grouped.setdefault(item.shipment_id, []).append(item)
+
+    rows: list[dict] = []
+    for sh in shipments:
+        for item in sorted(grouped.get(sh.id, []), key=lambda i: i.seq):
+            brand, price = by_project.get(
+                (item.order_id or "", sh.project_no or ""),
+                by_order.get(item.order_id or "", ("", 0.0)),
+            )
+            qty = item.quantity or 0
+            rows.append(
+                {
+                    "material_no": item.material_no,
+                    "product": item.product,
+                    "model": item.model,
+                    "brand": brand,
+                    "quantity": qty,
+                    "unit_price": price,
+                    "amount": round(qty * price, 2),
+                    # 备注（订单号）印客户的采购单号：同一客户的采购单号不会重复，
+                    # 所以不需要模板里那种 -1 后缀来区分
+                    "purchase_no": sh.purchase_no,
+                    "project_no": sh.project_no,
+                }
+            )
+    return rows
+
+
+@router.get("/{shipment_id}/statement", response_class=HTMLResponse)
+def print_statement(
+    shipment_id: int,
+    scope: str = "month",
+    title: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """客户对账单。scope=month 把该客户当月所有送货单拼成一张，scope=single 只本单。
+
+    为什么按「客户 + 月份」聚合：客户的账是一月一对，同一客户同月有三张送货单时，
+    从哪一行点进来都该得到同一张表；做单张的话财务还得自己拼。
+
+    月份口径取**出货日期**（ship_date）而不是开单时间 —— 送货单抬头印的是出货日期，
+    对账要跟客户手上的纸对得上。ship_date 为空的老单退回 created_at，与
+    backfill_ship_date 的补值一致。
+
+    这个页面允许不带 token 打开：预览是「新标签页直达 URL」，页面本身改不了任何
+    数据，和送货单打印页（GET /{id}/print）一个口径。
+    """
+    anchor = db.query(Shipment).filter(Shipment.id == shipment_id).first()
+    if not anchor:
+        raise HTTPException(404, f"出货记录单不存在: #{shipment_id}")
+
+    day = anchor.ship_date or anchor.created_at.date()
+    first_day = day.replace(day=1)
+    next_month = (first_day + timedelta(days=32)).replace(day=1)
+    ship_day = func.coalesce(Shipment.ship_date, func.date(Shipment.created_at))
+
+    month_shipments = (
+        db.query(Shipment)
+        .filter(
+            Shipment.party_a == anchor.party_a,
+            ship_day >= first_day,
+            ship_day < next_month,
+        )
+        .order_by(ship_day, Shipment.doc_no)
+        .all()
+    )
+    if scope == "single":
+        picked = [anchor]
+    else:
+        picked = month_shipments
+        scope = "month"
+
+    rows = _statement_rows(db, picked)
+    total = round(sum(r["amount"] for r in rows), 2)
+    period = f"{day.year}年{day.month}月"
+    short = _short_customer(anchor.party_a)
+    default_title = (
+        f"{short}-{anchor.doc_no}-对账单"
+        if scope == "single"
+        else f"{short}-{period}对账单"
+    )
+    empty_hint = (
+        f"本单没有出货明细（{anchor.doc_no}）"
+        if scope == "single"
+        else f"{period}没有 {anchor.party_a} 的出货记录"
+    )
+    return HTMLResponse(
+        content=render_statement(
+            customer=anchor.party_a,
+            supplier=anchor.ship_from,
+            period=period,
+            rows=rows,
+            total=total,
+            title=(title or "").strip() or default_title,
+            scope=scope,
+            month_label=f"{anchor.party_a} · {period}（共 {len(month_shipments)} 张送货单）",
+            single_label=f"仅本单 {anchor.doc_no}",
+            empty_hint=empty_hint,
+        )
+    )
+
