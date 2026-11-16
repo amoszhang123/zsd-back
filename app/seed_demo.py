@@ -17,7 +17,12 @@ import argparse
 from datetime import date, datetime, timedelta
 
 from app.database import SessionLocal
-from app.invoice_storage import delete_invoice_file, save_invoice_image
+from app.invoice_storage import (
+    VOUCHER_DIR,
+    delete_invoice_file,
+    save_image,
+    save_invoice_image,
+)
 from app.models.contract import (
     CONTRACT_STATUS_CANCELLED,
     CONTRACT_STATUS_CLOSED,
@@ -27,6 +32,8 @@ from app.models.contract import (
     ContractItem,
 )
 from app.models.cost import CostInvoice, CostRecord
+from app.models.cash import CashEntry, CashVoucher
+from app.models.revenue import RevenueRecord
 from app.models.order import (
     MATERIAL_PREP_ENABLED,
     MATERIAL_STEP,
@@ -68,9 +75,12 @@ NOW = datetime.now()
 # 清空时的顺序：先子后父，否则外键会拦。
 # 顺序即依赖顺序，改动模型时请同步维护这张表。
 DELETE_ORDER = [
-    # 发票先于成本：子表在前，父表在后
+    # 发票/凭证先于父表：子表在前，父表在后
     CostInvoice,
     CostRecord,
+    CashVoucher,
+    CashEntry,
+    RevenueRecord,
     DispositionOwner,
     RepairOrder,
     ReworkOrder,
@@ -611,6 +621,147 @@ def _seed_costs(db) -> None:
                 print(f"  样例发票落盘失败（不影响其它数据）: {e}")
 
 
+def _period(months_back: int = 0) -> str:
+    """当前月份往前推 N 个月的 "YYYY-MM"。用来造跨月的收入记录。"""
+    year, month = TODAY.year, TODAY.month
+    for _ in range(months_back):
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+    return f"{year}-{month:02d}"
+
+
+def _sample_voucher_png() -> bytes:
+    """一张「转账成功」的样例截图，给费用收支的凭证图用。
+
+    审核员点开凭证要能看到图，空着会被当成功能没做完。画不出来就跳过（上层已兜住）。
+    """
+    import io
+
+    from PIL import Image, ImageDraw
+
+    from app.order_label import _font
+
+    width, height = 720, 1000
+    img = Image.new("RGB", (width, height), (245, 246, 248))
+    draw = ImageDraw.Draw(img)
+
+    draw.rectangle([0, 0, width, 120], fill=(7, 193, 96))
+    draw.text((40, 40), "转账成功", font=_font(38), fill=(255, 255, 255))
+    draw.text((40, 88), "¥620.00", font=_font(22), fill=(230, 255, 235))
+
+    draw.rectangle([32, 150, width - 32, 470], fill=(255, 255, 255))
+    rows = [
+        ("收款方", "顺丰速运有限公司"),
+        ("付款方式", "企业网银"),
+        ("转账时间", f"{TODAY:%Y-%m-%d} 14:26:31"),
+        ("转账单号", "20261116001426"),
+        ("备注", "发货到昆山（样例）"),
+    ]
+    for i, (label, value) in enumerate(rows):
+        y = 180 + i * 56
+        draw.text((56, y), label, font=_font(18), fill=(140, 140, 140))
+        draw.text((240, y), value, font=_font(18), fill=(40, 40, 40))
+
+    draw.rectangle([32, 500, width - 32, 620], fill=(255, 255, 255))
+    draw.text((56, 530), "说明", font=_font(18), fill=(140, 140, 140))
+    draw.text((56, 566), "样例凭证图，仅用于演示，不具备法律效力", font=_font(17), fill=(90, 90, 90))
+
+    draw.text((width / 2 - 90, 900), "—— 样例，非真实凭证 ——", font=_font(16), fill=(180, 180, 180))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+# (方向, 类别, 金额, 对方, 备注, 几天前)
+CASH_ENTRIES = [
+    ("out", "房租", 6500.0, "房东王", "上月厂房租金", 45),
+    ("out", "水电", 1620.0, "供电所", "上月电费", 35),
+    ("out", "房租", 6500.0, "房东王", "本月厂房租金", 15),
+    ("out", "水电", 1830.0, "供电所", "本月电费", 9),
+    ("out", "工资", 26500.0, "工资代发", "本月工资（5 人）", 6),
+    ("out", "运费", 620.0, "顺丰速运", "发货到昆山", 4),
+    ("in", "废料", 2600.0, "城东废品回收", "废铝屑 210kg", 8),
+    ("in", "租赁", 1500.0, "同业加工", "外借铣床 3 天", 2),
+]
+
+# (客户, 往前几个月, 确认金额, 已收金额, 收款在几天前, 是否开票, 备注)
+REVENUE_SEEDS = [
+    ("昆山精工机械有限公司", 1, 62300.0, 62300.0, 13, True, "上月对账单，已结清"),
+    ("昆山精工机械有限公司", 0, 48600.0, 20000.0, 4, True, "本月对账单，收了一部分"),
+    ("苏州华翔电子有限公司", 0, 32400.0, 0.0, None, False, "本月对账单，未开票未收款"),
+]
+
+
+def _seed_cash(db) -> None:
+    """费用收支：跨两个月、收支配齐，其中一笔带样例凭证图。
+
+    这些表都继承 TenantScoped，测试域的记录与真实账目互不可见 ——
+    所以这里可以放心造带金额的账，不会出现在厂里的真实流水里。
+    """
+    sample = None
+    try:
+        sample = _sample_voucher_png()
+    except Exception as e:  # 缺字体/绘制异常都不该让整个种子失败
+        print(f"  样例凭证生成失败（不影响其它数据）: {e}")
+
+    for index, (direction, category, amount, party, remark, days) in enumerate(CASH_ENTRIES):
+        entry = CashEntry(
+            direction=direction,
+            category=category,
+            amount=amount,
+            counterparty=party,
+            remark=remark,
+            entry_date=TODAY - timedelta(days=days),
+        )
+        db.add(entry)
+        db.flush()  # 拿自增 id 才能挂凭证
+
+        # 挂给「运费」那一笔：审核员点开一条支出就能看到凭证长什么样
+        if category == "运费" and sample:
+            try:
+                meta = save_image(sample, "转账凭证.png", VOUCHER_DIR)
+                db.add(
+                    CashVoucher(
+                        entry_id=entry.id,
+                        file_path=meta["file_path"],
+                        filename=meta["filename"],
+                        size=meta["size"],
+                        content_type=meta["content_type"],
+                        source="mp",
+                        uploaded_by=f"{TEST_ACCOUNT_ID} {TEST_NAME}",
+                    )
+                )
+            except Exception as e:
+                print(f"  样例凭证落盘失败（不影响其它数据）: {e}")
+
+
+def _seed_revenue(db) -> None:
+    """订单收入：三笔已确认（一个已结清、一个部分收款、一个未收）。
+
+    刻意**不造送货单**：shipments/shipment_items 没有 is_test 列、不参与数据域隔离，
+    往它们里面写测试数据会直接出现在厂里的真实送货单列表和月度对账单上。
+    代价是测试域的「待确认清单」是空的（没有测试出货单可汇总），
+    页面会显示「已出货的月份都确认完了」—— 这是一个合法的空状态，
+    不会让审核员以为功能坏了；已确认列表和未收余额照样有数据可看。
+    """
+    for customer, months_back, amount, received, received_days, invoiced, remark in REVENUE_SEEDS:
+        db.add(
+            RevenueRecord(
+                customer=customer,
+                period=_period(months_back),
+                amount=amount,
+                shipped_amount=amount,
+                invoiced=invoiced,
+                received_amount=received,
+                received_on=(TODAY - timedelta(days=received_days)) if received_days else None,
+                remark=remark,
+                confirmed_at=NOW - timedelta(days=received_days or 5),
+            )
+        )
+
+
 def seed() -> None:
     db = SessionLocal()
     try:
@@ -628,6 +779,8 @@ def seed() -> None:
         _seed_programmers(db)
         _seed_materials(db, orders)
         _seed_costs(db)
+        _seed_cash(db)
+        _seed_revenue(db)
         db.commit()
 
         print("演示数据已写入（is_test=1）：")
@@ -637,6 +790,8 @@ def seed() -> None:
         print(f"  合同 {len(CONTRACTS)} 份（正常/暂停/取消/结案各一）")
         print(f"  报价单 {len(QUOTES)} 张、完工开工单 2 张、质检批次 6 条、异常单 3 张")
         print(f"  成本 {len(COSTS)} 笔（其中 1 笔带样例发票、1 笔已开票待补图）")
+        print(f"  费用收支 {len(CASH_ENTRIES)} 笔（其中 1 笔带样例凭证），订单收入 {len(REVENUE_SEEDS)} 笔已确认")
+        print("  说明：测试域没有测试送货单，所以「待确认收入」为空是正常的")
     finally:
         db.close()
 

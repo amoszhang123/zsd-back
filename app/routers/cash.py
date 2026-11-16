@@ -93,13 +93,8 @@ def list_cash_entries(db: Session) -> list[CashEntryOut]:
     return [_to_out(r, grouped.get(r.id)) for r in rows]
 
 
-@router.get("", response_model=list[CashEntryOut])
-def list_cash(db: Session = Depends(get_db)):
-    return list_cash_entries(db)
-
-
-@router.post("", response_model=CashEntryOut)
-def create_cash(req: CashEntryIn, db: Session = Depends(get_db)):
+def create_cash_entry(req: CashEntryIn, db: Session) -> CashEntryOut:
+    """新建一笔收付款。web 与小程序共用（小程序那边只多一道管理员校验）。"""
     entry = CashEntry(**req.model_dump())
     db.add(entry)
     db.commit()
@@ -107,30 +102,46 @@ def create_cash(req: CashEntryIn, db: Session = Depends(get_db)):
     return _to_out(entry)
 
 
-# ⚠ /vouchers/{id} 必须声明在 /{entry_id} 之前：FastAPI 按声明顺序匹配，
-# 否则 DELETE /api/cash/vouchers/5 会先命中 /{entry_id}，把 "vouchers" 当整数解析，422。
-@router.delete("/vouchers/{voucher_id}")
-def delete_voucher(voucher_id: int, db: Session = Depends(get_db)):
-    voucher = db.query(CashVoucher).filter(CashVoucher.id == voucher_id).first()
-    if not voucher:
-        raise HTTPException(404, f"凭证不存在: #{voucher_id}")
-    file_path = voucher.file_path
-    db.delete(voucher)
+def update_cash_entry(entry: CashEntry, req: CashEntryUpdate, db: Session) -> CashEntryOut:
+    """部分更新：只改传了值的字段（靠 exclude_unset 区分「没传」和「传了空」）。"""
+    for field, value in req.model_dump(exclude_unset=True).items():
+        setattr(entry, field, value)
     db.commit()
-    # 先提交再删文件：反过来的话事务回滚会留下指向空气的库行（裂图），
-    # 而多一个孤儿文件的代价是零。
-    delete_invoice_file(file_path)
-    return {"deleted": voucher_id}
+    db.refresh(entry)
+    return _to_out(entry, vouchers_of(db, [entry.id]).get(entry.id))
 
 
-@router.post("/{entry_id}/vouchers", response_model=CashEntryOut)
-async def upload_voucher(
-    entry_id: int,
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-):
-    entry = get_entry_or_404(db, entry_id)
+def delete_cash_entry(entry: CashEntry, db: Session) -> int:
+    """删一笔，连凭证一起真删。
 
+    先提交库、再动磁盘：反过来的话事务回滚会留下指向空气的库行（前端裂图），
+    而多一个孤儿文件的代价是零。
+    """
+    # 主键先取出来：commit 之后对象会过期，行又已经删了，再读 entry.id 会抛 ObjectDeletedError
+    entry_id = entry.id
+    paths = [
+        v.file_path
+        for v in db.query(CashVoucher).filter(CashVoucher.entry_id == entry_id).all()
+    ]
+    db.query(CashVoucher).filter(CashVoucher.entry_id == entry_id).delete(
+        synchronize_session=False
+    )
+    db.delete(entry)
+    db.commit()
+    for path in paths:
+        delete_invoice_file(path)
+    return entry_id
+
+
+def attach_voucher(
+    db: Session,
+    entry: CashEntry,
+    data: bytes,
+    original_name: str,
+    source: str = "web",
+    uploaded_by: str = "web",
+) -> CashEntryOut:
+    """校验、落盘、建行。web 与小程序共用这一条路径。"""
     # 计数必须显式带 scoped：只查聚合的语句不走 with_loader_criteria，
     # 测试域会把生产域的凭证也数进来。
     existing = (
@@ -144,45 +155,70 @@ async def upload_voucher(
             400, f"一笔最多挂 {MAX_VOUCHERS_PER_ENTRY} 张凭证，请先删掉不需要的再传"
         )
 
-    meta = save_image(await file.read(), file.filename or "", VOUCHER_DIR)
-    voucher = CashVoucher(
-        entry_id=entry.id,
-        file_path=meta["file_path"],
-        filename=meta["filename"],
-        size=meta["size"],
-        content_type=meta["content_type"],
-        source="web",
-        uploaded_by="web",
+    meta = save_image(data, original_name, VOUCHER_DIR)
+    db.add(
+        CashVoucher(
+            entry_id=entry.id,
+            file_path=meta["file_path"],
+            filename=meta["filename"],
+            size=meta["size"],
+            content_type=meta["content_type"],
+            source=source,
+            uploaded_by=uploaded_by,
+        )
     )
-    db.add(voucher)
     db.commit()
     db.refresh(entry)
     return _to_out(entry, vouchers_of(db, [entry.id]).get(entry.id))
+
+
+def remove_voucher(db: Session, voucher: CashVoucher) -> int:
+    """删一张凭证：先删库行并提交，再删文件。"""
+    file_path = voucher.file_path
+    voucher_id = voucher.id
+    db.delete(voucher)
+    db.commit()
+    delete_invoice_file(file_path)
+    return voucher_id
+
+
+@router.get("", response_model=list[CashEntryOut])
+def list_cash(db: Session = Depends(get_db)):
+    return list_cash_entries(db)
+
+
+@router.post("", response_model=CashEntryOut)
+def create_cash(req: CashEntryIn, db: Session = Depends(get_db)):
+    return create_cash_entry(req, db)
+
+
+# ⚠ /vouchers/{id} 必须声明在 /{entry_id} 之前：FastAPI 按声明顺序匹配，
+# 否则 DELETE /api/cash/vouchers/5 会先命中 /{entry_id}，把 "vouchers" 当整数解析，422。
+@router.delete("/vouchers/{voucher_id}")
+def delete_voucher(voucher_id: int, db: Session = Depends(get_db)):
+    voucher = db.query(CashVoucher).filter(CashVoucher.id == voucher_id).first()
+    if not voucher:
+        raise HTTPException(404, f"凭证不存在: #{voucher_id}")
+    return {"deleted": remove_voucher(db, voucher)}
+
+
+@router.post("/{entry_id}/vouchers", response_model=CashEntryOut)
+async def upload_voucher(
+    entry_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    entry = get_entry_or_404(db, entry_id)
+    return attach_voucher(
+        db, entry, await file.read(), file.filename or "", source="web", uploaded_by="web"
+    )
 
 
 @router.patch("/{entry_id}", response_model=CashEntryOut)
 def update_cash(entry_id: int, req: CashEntryUpdate, db: Session = Depends(get_db)):
-    entry = get_entry_or_404(db, entry_id)
-    for field, value in req.model_dump(exclude_unset=True).items():
-        setattr(entry, field, value)
-    db.commit()
-    db.refresh(entry)
-    return _to_out(entry, vouchers_of(db, [entry.id]).get(entry.id))
+    return update_cash_entry(get_entry_or_404(db, entry_id), req, db)
 
 
 @router.delete("/{entry_id}")
 def delete_cash(entry_id: int, db: Session = Depends(get_db)):
-    entry = get_entry_or_404(db, entry_id)
-    # 连凭证一起真删，理由同成本发票：留着文件等于没删，反复删传还会堆孤儿文件。
-    paths = [
-        v.file_path
-        for v in db.query(CashVoucher).filter(CashVoucher.entry_id == entry.id).all()
-    ]
-    db.query(CashVoucher).filter(CashVoucher.entry_id == entry.id).delete(
-        synchronize_session=False
-    )
-    db.delete(entry)
-    db.commit()
-    for path in paths:
-        delete_invoice_file(path)
-    return {"deleted": entry_id}
+    return {"deleted": delete_cash_entry(get_entry_or_404(db, entry_id), db)}

@@ -154,13 +154,7 @@ def _remaining(db: Session, customer: str, period: str, exclude_amount: float = 
     return shipped, done, shipped - done
 
 
-@router.get("", response_model=RevenueBoardOut)
-def get_board(db: Session = Depends(get_db)):
-    return board(db)
-
-
-@router.post("/confirm", response_model=RevenueOut)
-def confirm(req: RevenueConfirmIn, db: Session = Depends(get_db)):
+def confirm_revenue(req: RevenueConfirmIn, db: Session) -> RevenueOut:
     """确认一笔收入。金额不能超过该客户该期的待确认余额。
 
     这道校验是防重复提交的最后一道闸：双击「确认」不会记成两笔。
@@ -192,16 +186,10 @@ def confirm(req: RevenueConfirmIn, db: Session = Depends(get_db)):
     return _to_out(record)
 
 
-def get_revenue_or_404(db: Session, record_id: int) -> RevenueRecord:
-    record = db.query(RevenueRecord).filter(RevenueRecord.id == record_id).first()
-    if not record:
-        raise HTTPException(404, f"收入记录不存在: #{record_id}")
-    return record
-
-
-@router.patch("/{record_id}", response_model=RevenueOut)
-def update_revenue(record_id: int, req: RevenueUpdate, db: Session = Depends(get_db)):
-    record = get_revenue_or_404(db, record_id)
+def update_revenue_record(
+    record: RevenueRecord, req: RevenueUpdate, db: Session
+) -> RevenueOut:
+    """改已确认的收入（金额、开票、收款、备注）。金额会重新校验上限。"""
     changes = req.model_dump(exclude_unset=True)
 
     if "amount" in changes:
@@ -231,15 +219,41 @@ def update_revenue(record_id: int, req: RevenueUpdate, db: Session = Depends(get
     return _to_out(record)
 
 
-@router.delete("/{record_id}")
-def withdraw(record_id: int, db: Session = Depends(get_db)):
+def withdraw_revenue(record: RevenueRecord, db: Session) -> int:
     """撤回一笔已确认的收入。
 
     撤回 = 删除。它本来就是从待确认里「确认」出来的，撤回后那笔钱会重新
     出现在待确认清单里，不需要留一条已撤回记录 —— 留着反而让「已确认合计」
     要处处排除它们。
     """
-    record = get_revenue_or_404(db, record_id)
+    record_id = record.id
     db.delete(record)
     db.commit()
-    return {"deleted": record_id}
+    return record_id
+
+
+@router.get("", response_model=RevenueBoardOut)
+def get_board(db: Session = Depends(get_db)):
+    return board(db)
+
+
+@router.post("/confirm", response_model=RevenueOut)
+def confirm(req: RevenueConfirmIn, db: Session = Depends(get_db)):
+    return confirm_revenue(req, db)
+
+
+def get_revenue_or_404(db: Session, record_id: int) -> RevenueRecord:
+    record = db.query(RevenueRecord).filter(RevenueRecord.id == record_id).first()
+    if not record:
+        raise HTTPException(404, f"收入记录不存在: #{record_id}")
+    return record
+
+
+@router.patch("/{record_id}", response_model=RevenueOut)
+def update_revenue(record_id: int, req: RevenueUpdate, db: Session = Depends(get_db)):
+    return update_revenue_record(get_revenue_or_404(db, record_id), req, db)
+
+
+@router.delete("/{record_id}")
+def withdraw(record_id: int, db: Session = Depends(get_db)):
+    return {"deleted": withdraw_revenue(get_revenue_or_404(db, record_id), db)}

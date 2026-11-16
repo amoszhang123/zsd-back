@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import settings
 from app.database import get_db, scoped
 from app.models.contract import blocked_orders
+from app.models.cash import CashVoucher
 from app.models.cost import CostInvoice
 from app.models.order import (
     ORDER_STATUS_FULFILLED,
@@ -85,6 +86,22 @@ from app.routers.costs import (
     record_out,
     remove_invoice,
 )
+from app.routers.cash import (
+    attach_voucher,
+    create_cash_entry,
+    delete_cash_entry,
+    get_entry_or_404,
+    list_cash_entries,
+    remove_voucher,
+    update_cash_entry,
+)
+from app.routers.revenue import (
+    board as revenue_board,
+    confirm_revenue,
+    get_revenue_or_404,
+    update_revenue_record,
+    withdraw_revenue,
+)
 from app.routers.orders import (
     batch_confirm,
     confirm_order,
@@ -110,6 +127,13 @@ from app.schemas.contract import (
     ContractSummary,
 )
 from app.schemas.cost import CostInvoiceOut, CostRecordIn, CostRecordOut
+from app.schemas.cash import CashEntryIn, CashEntryOut, CashEntryUpdate
+from app.schemas.revenue import (
+    RevenueBoardOut,
+    RevenueConfirmIn,
+    RevenueOut,
+    RevenueUpdate,
+)
 from app.schemas.order import (
     BatchConfirmRequest,
     BatchConfirmResponse,
@@ -2687,3 +2711,128 @@ def mp_delete_cost_invoice(
         raise HTTPException(404, f"发票不存在: #{invoice_id}")
     remove_invoice(db, invoice)
     return {"deleted": invoice_id}
+
+
+# ---------------- 经营管理：费用收支（仅管理员，全功能） ----------------
+# 小程序端开的是全功能（增/改/删 + 传凭证），业务逻辑全走 routers/cash.py，
+# 与 web 完全同一条路径；这里只负责把门和记录操作人。
+# 误操作的防线放在前端（删除二次确认），后端不做软删 —— 与成本页口径一致：
+# 改错就删了重录，留软删标记会让每一处统计都要额外排除它。
+
+
+@router.get("/cash", response_model=list[CashEntryOut])
+def mp_list_cash(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    """全部费用收支。筛选与统计交给前端，与 web 的 GET /api/cash 返回一致。"""
+    _require_admin(user, db, "费用收支")
+    return list_cash_entries(db)
+
+
+@router.post("/cash", response_model=CashEntryOut)
+def mp_create_cash(
+    req: CashEntryIn,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    """记一笔收付款。数据域由 Session 的 before_flush 按 token 自动打标。"""
+    _require_admin(user, db, "费用收支")
+    return create_cash_entry(req, db)
+
+
+@router.delete("/cash/vouchers/{voucher_id}")
+def mp_delete_voucher(
+    voucher_id: int,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    """删一张传错的凭证。查询走 ORM，is_test 过滤自动生效。"""
+    _require_admin(user, db, "费用收支")
+    voucher = db.query(CashVoucher).filter(CashVoucher.id == voucher_id).first()
+    if not voucher:
+        raise HTTPException(404, f"凭证不存在: #{voucher_id}")
+    return {"deleted": remove_voucher(db, voucher)}
+
+
+@router.post("/cash/{entry_id}/vouchers", response_model=CashEntryOut)
+async def mp_upload_voucher(
+    entry_id: int,
+    file: UploadFile = File(...),
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    """补一张凭证（转账截图/收据）。校验与落盘全走 cash.attach_voucher。"""
+    emp = _require_admin(user, db, "费用收支")
+    entry = get_entry_or_404(db, entry_id)
+    return attach_voucher(
+        db,
+        entry,
+        await file.read(),
+        file.filename or "",
+        source="mp",
+        uploaded_by=f"{emp.id} {emp.name}".strip(),
+    )
+
+
+@router.patch("/cash/{entry_id}", response_model=CashEntryOut)
+def mp_update_cash(
+    entry_id: int,
+    req: CashEntryUpdate,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user, db, "费用收支")
+    return update_cash_entry(get_entry_or_404(db, entry_id), req, db)
+
+
+@router.delete("/cash/{entry_id}")
+def mp_delete_cash(
+    entry_id: int,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user, db, "费用收支")
+    return {"deleted": delete_cash_entry(get_entry_or_404(db, entry_id), db)}
+
+
+# ---------------- 经营管理：订单收入（仅管理员，全功能） ----------------
+# 待确认清单、确认、改金额、撤回全部开放。手机上这两个动作风险最高
+# （确认会生成账目、撤回会抹掉一笔收入），前端各加一道 showModal 二次确认，
+# 后端仍按「累计确认不能超过出货额」把关 —— 前端提示挡得住手滑，挡不住看错客户，
+# 但账目本身不会因为误点而错账。
+
+
+@router.get("/revenue", response_model=RevenueBoardOut)
+def mp_revenue_board(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    """待确认清单 + 已确认列表，与 web 的 GET /api/revenue 同一份实现。"""
+    _require_admin(user, db, "订单收入")
+    return revenue_board(db)
+
+
+@router.post("/revenue/confirm", response_model=RevenueOut)
+def mp_confirm_revenue(
+    req: RevenueConfirmIn,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user, db, "订单收入")
+    return confirm_revenue(req, db)
+
+
+@router.patch("/revenue/{record_id}", response_model=RevenueOut)
+def mp_update_revenue(
+    record_id: int,
+    req: RevenueUpdate,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user, db, "订单收入")
+    return update_revenue_record(get_revenue_or_404(db, record_id), req, db)
+
+
+@router.delete("/revenue/{record_id}")
+def mp_withdraw_revenue(
+    record_id: int,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    _require_admin(user, db, "订单收入")
+    return {"deleted": withdraw_revenue(get_revenue_or_404(db, record_id), db)}
