@@ -38,6 +38,9 @@ MAX_INVOICES_PER_COST = 9
 MAX_INVOICE_PIXELS = 40_000_000
 
 INVOICE_DIR = "invoices"
+# 费用收支的凭证图（转账截图/收据）。与发票走同一套校验与落盘，只是分目录存，
+# 免得以后要按业务清目录时分不清哪张是发票、哪张是转账截图。
+VOUCHER_DIR = "vouchers"
 
 
 def _root() -> Path:
@@ -76,11 +79,14 @@ def _safe_filename(name: str) -> str:
     return cleaned[:200] or "未命名图片"
 
 
-def save_invoice_image(data: bytes, original_name: str = "") -> dict:
-    """校验并保存一张发票图，返回可直接写进 cost_invoices 的字段。
+def save_image(data: bytes, original_name: str = "", subdir: str = INVOICE_DIR) -> dict:
+    """校验并保存一张图片，返回可直接写进 *_invoices / *_vouchers 的字段。
 
     校验顺序刻意是「空 → 大小 → 类型」：先报大小能省掉一次图片解码，
     而且用户最需要看到的就是"你这张太大了"。
+
+    subdir 决定落到 uploads 下的哪个子目录（invoices / vouchers），
+    校验口径与文件名规则不分业务，只有目录不同。
     """
     if not data:
         raise HTTPException(400, "上传的文件是空的，请重新选择图片")
@@ -121,7 +127,7 @@ def save_invoice_image(data: bytes, original_name: str = "") -> dict:
         )
 
     now = datetime.now()
-    rel_dir = Path(INVOICE_DIR) / f"{now:%Y}" / f"{now:%m}"
+    rel_dir = Path(subdir) / f"{now:%Y}" / f"{now:%m}"
     target_dir = _root() / rel_dir
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -134,6 +140,11 @@ def save_invoice_image(data: bytes, original_name: str = "") -> dict:
         "size": len(data),
         "content_type": content_type,
     }
+
+
+def save_invoice_image(data: bytes, original_name: str = "") -> dict:
+    """保存一张成本发票图。薄封装，保持既有调用方（web / 小程序）不用改。"""
+    return save_image(data, original_name, INVOICE_DIR)
 
 
 def resolve(rel_path: str) -> Path | None:

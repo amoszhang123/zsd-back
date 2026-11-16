@@ -27,6 +27,8 @@ from app.models.inventory import (
     MaterialScrapOrder,
 )
 from app.models.bank import BankStatement, BankTransaction
+from app.models.cash import CashEntry, CashVoucher
+from app.models.revenue import RevenueRecord
 from app.models.permission import PositionModulePermission
 
 __all__ = [
@@ -41,5 +43,7 @@ __all__ = [
     "Material", "MaterialMovement", "IssueOrder", "IssueItem",
     "MaterialScrapOrder", "MaterialScrapItem",
     "BankStatement", "BankTransaction",
+    "CashEntry", "CashVoucher",
+    "RevenueRecord",
     "PositionModulePermission",
 ]
