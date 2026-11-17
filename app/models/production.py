@@ -37,6 +37,13 @@ class Employee(TenantScoped, Base):
     status: Mapped[str] = mapped_column(String(10), default="在职")
     position: Mapped[str] = mapped_column(String(20), default="操作工")
     employee_type: Mapped[str] = mapped_column(String(10), default=EMPLOYEE_TYPE_DIRECT)
+    # —— 班次覆盖（考勤用）——
+    # 空字符串 / -1 表示「跟在职全厂设置走」：只有保洁、门卫这类和车间不同点的人
+    # 才需要单独填，其余人留空。存字符串而非 Time：MySQL 的 TIME 列在跨库同步时
+    # 时区处理很烦，而这里只需要 "HH:MM" 给人看和拼日期。
+    work_start: Mapped[str] = mapped_column(String(5), default="")
+    work_end: Mapped[str] = mapped_column(String(5), default="")
+    rest_minutes: Mapped[int] = mapped_column(Integer, default=-1)
 
 
 class Machine(TenantScoped, Base):

@@ -102,6 +102,19 @@ from app.routers.revenue import (
     update_revenue_record,
     withdraw_revenue,
 )
+from app.routers.attendance import (
+    WEEKDAY_LABELS,
+    _balance_rows,
+    _person_month,
+    calendar as attendance_calendar,
+    create_leave,
+    expand_leaves,
+    list_leaves,
+    list_types,
+    settings_or_default,
+)
+from app.models.attendance import AttendanceRecord, SOURCE_MP
+from app import attendance_calc as att_calc
 from app.routers.orders import (
     batch_confirm,
     confirm_order,
@@ -127,6 +140,14 @@ from app.schemas.contract import (
     ContractSummary,
 )
 from app.schemas.cost import CostInvoiceOut, CostRecordIn, CostRecordOut
+from app.schemas.attendance import (
+    AttendanceCalendarOut,
+    ClockIn,
+    LeaveRequestIn,
+    LeaveRequestOut,
+    LeaveTypeOut,
+    TodayOut,
+)
 from app.schemas.cash import CashEntryIn, CashEntryOut, CashEntryUpdate
 from app.schemas.revenue import (
     RevenueBoardOut,
@@ -2836,3 +2857,135 @@ def mp_withdraw_revenue(
 ):
     _require_admin(user, db, "订单收入")
     return {"deleted": withdraw_revenue(get_revenue_or_404(db, record_id), db)}
+
+
+# ---------------- 考勤（小程序：打卡 + 我的考勤 + 请假） ----------------
+# 打卡时间一律用服务器时间：手机本地时间可以随便改，把时间调到 08:00 再打卡，
+# 用客户端时间的系统就会认。客户端只负责把定位一起发上来。
+#
+# 定位只留底、不拦截。铁皮厂房里 GPS 漂移几百米是常事，硬拦会让「人在车间却
+# 打不上卡」，那种怨气比考勤漏洞更难处理；漂移记录留着，事后核查用得上。
+
+
+def _today_payload(db: Session, emp: Employee) -> TodayOut:
+    settings = settings_or_default(db)
+    workdays = att_calc.parse_workdays(settings["workdays"])
+    now = datetime.now()
+    day = now.date()
+    rec = (
+        db.query(AttendanceRecord)
+        .filter(AttendanceRecord.employee_id == emp.id, AttendanceRecord.work_date == day)
+        .first()
+    )
+    leaves = expand_leaves(db, day, day)
+    cell = att_calc.day_status(day, emp, rec, leaves.get((emp.id, day)), settings, workdays)
+    start_t, end_t, _rest = att_calc.shift_of(emp, settings)
+    return TodayOut(
+        date=day.isoformat(),
+        weekday_label=WEEKDAY_LABELS[day.isoweekday() - 1],
+        work_start=start_t.strftime("%H:%M"),
+        work_end=end_t.strftime("%H:%M"),
+        clock_in=cell["clock_in"],
+        clock_out=cell["clock_out"],
+        status=cell["status"],
+        status_label=cell["status_label"],
+        leave_type=cell["leave_type"],
+        server_time=now.strftime("%H:%M:%S"),
+    )
+
+
+@router.get("/attendance/today", response_model=TodayOut)
+def mp_attendance_today(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    return _today_payload(db, _current_employee(user, db))
+
+
+@router.post("/attendance/clock", response_model=TodayOut)
+def mp_attendance_clock(
+    req: ClockIn,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    emp = _current_employee(user, db)
+    settings = settings_or_default(db)
+    now = datetime.now()
+    day = now.date()
+
+    enabled_from = settings.get("enabled_from")
+    if enabled_from and day < enabled_from:
+        raise HTTPException(400, f"考勤从 {enabled_from} 起启用，今天还打不了卡")
+
+    row = (
+        db.query(AttendanceRecord)
+        .filter(AttendanceRecord.employee_id == emp.id, AttendanceRecord.work_date == day)
+        .first()
+    )
+
+    if req.action == "in":
+        if row and row.clock_in:
+            raise HTTPException(400, f"今天已经打过上班卡了（{row.clock_in:%H:%M}）")
+        if row is None:
+            row = AttendanceRecord(
+                employee_id=emp.id, work_date=day, source=SOURCE_MP, operator_id=emp.id
+            )
+            db.add(row)
+        row.clock_in = now
+        row.in_lat = req.lat
+        row.in_lng = req.lng
+        row.in_addr = req.addr
+    else:
+        if row is None or not row.clock_in:
+            raise HTTPException(400, "还没打上班卡，先打上班卡")
+        if row.clock_out:
+            raise HTTPException(400, f"今天已经打过下班卡了（{row.clock_out:%H:%M}）")
+        row.clock_out = now
+        row.out_lat = req.lat
+        row.out_lng = req.lng
+        row.out_addr = req.addr
+
+    db.commit()
+    return _today_payload(db, emp)
+
+
+@router.get("/attendance/calendar", response_model=AttendanceCalendarOut)
+def mp_attendance_calendar(
+    month: str = "",
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    """只看自己的。员工之间互不可见 —— 谁几点来、请了几天假是隐私。"""
+    emp = _current_employee(user, db)
+    return attendance_calendar(month=month, employee_id=emp.id, db=db)
+
+
+@router.get("/attendance/types", response_model=list[LeaveTypeOut])
+def mp_attendance_types(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    """启用的假期类型，提交请假时选。"""
+    return [t for t in list_types(db=db) if t.active]
+
+
+@router.get("/attendance/leave-balance")
+def mp_attendance_balance(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    """自己的假期余额（只有管余额的类型才有行）。"""
+    emp = _current_employee(user, db)
+    rows = _balance_rows(db, datetime.now().year)
+    return [r for r in rows if r.employee_id == emp.id]
+
+
+@router.get("/attendance/leaves", response_model=list[LeaveRequestOut])
+def mp_attendance_leaves(user=Depends(_get_mp_user), db: Session = Depends(get_db)):
+    emp = _current_employee(user, db)
+    return list_leaves(status="", month="", employee_id=emp.id, db=db)
+
+
+@router.post("/attendance/leaves", response_model=LeaveRequestOut)
+def mp_attendance_create_leave(
+    req: LeaveRequestIn,
+    user=Depends(_get_mp_user),
+    db: Session = Depends(get_db),
+):
+    """给自己请假。业务校验（天数自洽、余额够不够）全走 web 那套。"""
+    emp = _current_employee(user, db)
+    if req.employee_id and req.employee_id != emp.id:
+        raise HTTPException(403, "只能给自己提交请假")
+    req.employee_id = emp.id
+    return create_leave(req, backfilled=False, created_by=emp.id, db=db)

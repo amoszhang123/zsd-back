@@ -12,7 +12,7 @@ from app.invoice_storage import ensure_root
 from app.routers import (
     health, dashboard, orders, contracts, quotes, shipments, production,
     employees, auth, mp, quality, costs, materials, machines, bank, permissions,
-    mp_materials, cash, revenue, overview,
+    mp_materials, cash, revenue, overview, attendance,
 )
 
 
@@ -86,6 +86,8 @@ app.include_router(materials.router)
 app.include_router(machines.router)
 app.include_router(bank.router)
 app.include_router(permissions.router)
+# 考勤（一期：打卡/请假/日历，不含工资）
+app.include_router(attendance.router)
 
 # 发票图片：直接按 /api/uploads/invoices/2026/11/<uuid>.jpg 直出。
 # 挂在 /api 前缀下是为了复用现有反代（线上 /api 已经指向本服务），

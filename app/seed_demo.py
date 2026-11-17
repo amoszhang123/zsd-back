@@ -33,6 +33,13 @@ from app.models.contract import (
 )
 from app.models.cost import CostInvoice, CostRecord
 from app.models.cash import CashEntry, CashVoucher
+from app.models.attendance import (
+    AttendanceRecord,
+    AttendanceSettings,
+    LeaveBalance,
+    LeaveRequest,
+    LeaveType,
+)
 from app.models.revenue import RevenueRecord
 from app.models.order import (
     MATERIAL_PREP_ENABLED,
@@ -81,6 +88,11 @@ DELETE_ORDER = [
     CashVoucher,
     CashEntry,
     RevenueRecord,
+    AttendanceRecord,
+    LeaveRequest,
+    LeaveBalance,
+    LeaveType,
+    AttendanceSettings,
     DispositionOwner,
     RepairOrder,
     ReworkOrder,
@@ -762,6 +774,167 @@ def _seed_revenue(db) -> None:
         )
 
 
+# 假期类型：(名称, 扣薪, 需审批, 管余额, 颜色, 排序)
+LEAVE_TYPES = [
+    ("事假", True, True, False, "#fa8c16", 1),
+    ("病假", True, True, False, "#eb2f96", 2),
+    ("年假", False, True, True, "#52c41a", 3),
+    ("调休", False, True, True, "#13c2c2", 4),
+    ("其他", True, True, False, "#8c8c8c", 5),
+]
+
+
+def _seed_attendance(db, employees) -> None:
+    """考勤：班次设置 + 假期类型 + 余额 + 本月打卡 + 三张请假单。
+
+    打卡铺满「本月已过去的工作日」，而不是只造两三天：审核员打开看板看到
+    一片红色缺勤，会以为这功能坏了。异常样本（迟到/缺卡/早退）各留一天，
+    让「哪些是异常」这件事在演示里看得见。
+    """
+    from datetime import time as dt_time
+
+    enabled_from = TODAY.replace(day=1)
+    db.add(
+        AttendanceSettings(
+            enabled_from=enabled_from,
+            work_start="08:00",
+            work_end="17:00",
+            rest_minutes=60,
+            late_grace_minutes=5,
+            workdays="1,2,3,4,5",
+        )
+    )
+
+    types: dict[str, LeaveType] = {}
+    for name, deduct, need, track, color, sort in LEAVE_TYPES:
+        t = LeaveType(
+            name=name, deduct_pay=deduct, need_approval=need,
+            track_balance=track, color=color, sort=sort, active=True,
+        )
+        db.add(t)
+        db.flush()
+        types[name] = t
+
+    # _seed_employees 返回 {工号: Employee}，这里一律按 values() 遍历
+    staff_all = list(employees.values())
+
+    # 余额：管余额的类型给每人发额度（年假 5 天、调休 2 天）
+    for emp in staff_all:
+        for key, quota in (("年假", 5), ("调休", 2)):
+            db.add(
+                LeaveBalance(
+                    employee_id=emp.id, year=TODAY.year,
+                    type_id=types[key].id, granted=quota, used=0,
+                )
+            )
+
+    staff = [e for e in staff_all if e.position != "管理员"]
+    # 本月已过去的工作日（且不早于启用日）
+    workdays = [
+        d
+        for d in (enabled_from + timedelta(days=i) for i in range((TODAY - enabled_from).days + 1))
+        if d.isoweekday() <= 5
+    ]
+
+    # 异常样本：工号 → {日期偏移: 情况}
+    anomalies = {
+        "999991": {"late": 6, "missing": 4},   # 第 6 天迟到、第 4 天只打上班
+        "999992": {"early": 5},                # 第 5 天早退
+        "999993": {"absent": 3},               # 第 3 天没来
+    }
+
+    for emp in staff:
+        plan = anomalies.get(emp.id, {})
+        for index, day in enumerate(workdays):
+            if plan.get("absent") == index:
+                continue  # 缺勤：那天不造记录
+            in_h, in_m = 7, 52 + (index * 3) % 9          # 07:52 ~ 08:00 之间
+            out_h, out_m = 17, 2 + (index * 5) % 12       # 17:02 ~ 17:13
+            if plan.get("late") == index:
+                in_h, in_m = 8, 28                        # 迟到 28 分钟
+            clock_out = datetime.combine(day, dt_time(out_h, out_m))
+            if plan.get("early") == index:
+                clock_out = datetime.combine(day, dt_time(16, 15))  # 早退 45 分钟
+            if plan.get("missing") == index:
+                clock_out = None                          # 只打上班
+            db.add(
+                AttendanceRecord(
+                    employee_id=emp.id,
+                    work_date=day,
+                    clock_in=datetime.combine(day, dt_time(in_h, in_m)),
+                    clock_out=clock_out,
+                    in_addr="昆山市玉山镇厂区",
+                    out_addr="昆山市玉山镇厂区" if clock_out else "",
+                    source="mp",
+                    operator_id=emp.id,
+                )
+            )
+
+    # 测试账号（管理员）单独铺满本月工作日：审核员登录后第一眼看到的是自己的考勤，
+    # 只造两三天的话，日历上会是一片缺勤，像功能坏了。
+    # 管理员不进全厂矩阵（他不用被考核），只在个人视角里可见。
+    for index, day in enumerate(workdays):
+        if day >= TODAY:
+            continue  # 今天及以后不打，留给审核员自己点打卡按钮
+        db.add(
+            AttendanceRecord(
+                employee_id=TEST_ACCOUNT_ID,
+                work_date=day,
+                clock_in=datetime.combine(day, dt_time(8, 1 + index % 4)),
+                clock_out=datetime.combine(day, dt_time(17, 5 + index % 7)),
+                in_addr="昆山市玉山镇厂区",
+                out_addr="昆山市玉山镇厂区",
+                source="mp",
+                operator_id=TEST_ACCOUNT_ID,
+            )
+        )
+
+    # 三张请假单：一张待批、一张已批（扣了年假余额）、一张已驳回
+    tomorrow = TODAY + timedelta(days=1)
+    db.add(
+        LeaveRequest(
+            employee_id="999992", type_id=types["年假"].id,
+            start_date=tomorrow, end_date=tomorrow, days=1,
+            reason="家里有事，请一天年假",
+            status="pending", created_by="999992",
+        )
+    )
+    approved_day = workdays[-2] if len(workdays) >= 2 else TODAY
+    db.add(
+        LeaveRequest(
+            employee_id="999991", type_id=types["年假"].id,
+            start_date=approved_day, end_date=approved_day, days=1,
+            reason="调休一天",
+            status="approved", approver_id=TEST_ACCOUNT_ID,
+            approved_at=NOW - timedelta(days=3), created_by="999991",
+        )
+    )
+    # 已批的那张年假要占掉 1 天余额。必须先 flush 再查 —— 前面 add 的余额行
+    # 还没进库，直接发 UPDATE 会命中 0 行，页面上就变成「批了假但余额没动」。
+    db.flush()
+    bal = (
+        db.query(LeaveBalance)
+        .filter(
+            LeaveBalance.employee_id == "999991",
+            LeaveBalance.type_id == types["年假"].id,
+        )
+        .first()
+    )
+    if bal:
+        bal.used = 1
+    db.add(
+        LeaveRequest(
+            employee_id="999993", type_id=types["病假"].id,
+            start_date=TODAY - timedelta(days=7), end_date=TODAY - timedelta(days=7), days=1,
+            half="pm", reason="感冒去医院",
+            status="rejected", approver_id=TEST_ACCOUNT_ID,
+            approved_at=NOW - timedelta(days=8),
+            reject_reason="当天要交样件，改天再请",
+            created_by="999993",
+        )
+    )
+
+
 def seed() -> None:
     db = SessionLocal()
     try:
@@ -781,6 +954,7 @@ def seed() -> None:
         _seed_costs(db)
         _seed_cash(db)
         _seed_revenue(db)
+        _seed_attendance(db, employees)
         db.commit()
 
         print("演示数据已写入（is_test=1）：")
@@ -792,6 +966,7 @@ def seed() -> None:
         print(f"  成本 {len(COSTS)} 笔（其中 1 笔带样例发票、1 笔已开票待补图）")
         print(f"  费用收支 {len(CASH_ENTRIES)} 笔（其中 1 笔带样例凭证），订单收入 {len(REVENUE_SEEDS)} 笔已确认")
         print("  说明：测试域没有测试送货单，所以「待确认收入」为空是正常的")
+        print(f"  考勤：{len(LEAVE_TYPES)} 类假期、全月打卡（含迟到/缺卡/早退/缺勤样本）、3 张请假单")
     finally:
         db.close()
 
