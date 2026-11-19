@@ -30,6 +30,10 @@ DB_NAME="${DB_NAME:-$(get_env DB_NAME factory_erp)}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-$(get_env DB_PASSWORD)}"
 SRC_CONTAINER="${DB_CONTAINER:-zsd-db}"
 TEST_CONTAINER="zsd-restore-drill"
+# 复用生产在用的镜像：本地一定已经拉过，避免临时容器因拉镜像失败/太慢而起不来。
+# 想换可以用 DRILL_IMAGE 覆盖。
+DRILL_IMAGE="${DRILL_IMAGE:-$(get_env DB_IMAGE docker.m.daocloud.io/library/mysql:8.0)}"
+DRILL_PASS="drill-only-not-production"
 
 WEBHOOK=""
 WEBHOOK_FILE="${WEBHOOK_FILE:-$APP_DIR/.webhook}"
@@ -61,28 +65,38 @@ echo "使用备份：$LATEST"
 # ---------- 1. 起临时库 ----------
 docker rm -f "$TEST_CONTAINER" >/dev/null 2>&1 || true
 docker run -d --name "$TEST_CONTAINER" \
-  -e MYSQL_ROOT_PASSWORD=drill-only-not-production \
+  -e MYSQL_ROOT_PASSWORD="$DRILL_PASS" \
   --network none \
-  mysql:8.0 --default-authentication-plugin=mysql_native_password >/dev/null \
-  || fail "临时 MySQL 容器启动失败（镜像是否还在？docker pull mysql:8.0）"
+  "$DRILL_IMAGE" --default-authentication-plugin=mysql_native_password >/dev/null \
+  || fail "临时 MySQL 容器启动失败（镜像 $DRILL_IMAGE 不可用）"
 
-# 等它可用，最多 60 秒
+# 等它真的能执行 SQL，最多 90 秒。
+#
+# 不能用 mysqladmin ping 判断：官方镜像启动时会先起一个临时 server 初始化数据目录，
+# 那期间 ping 已经能响（返回 0），但 root 密码还没生效、也不能建库 ——
+# 紧接着的 CREATE DATABASE 就会失败，报「创建演练库失败」却看不到原因。
 READY=0
-for i in $(seq 1 60); do
-  if docker exec "$TEST_CONTAINER" mysqladmin ping -uroot -pdrill-only-not-production --silent >/dev/null 2>&1; then
+for i in $(seq 1 90); do
+  if docker exec -e MYSQL_PWD="$DRILL_PASS" "$TEST_CONTAINER" \
+       mysql -uroot -e "SELECT 1" >/dev/null 2>&1; then
     READY=1; break
   fi
   sleep 1
 done
-[ "$READY" = "1" ] || fail "临时 MySQL 60 秒内没有就绪"
+[ "$READY" = "1" ] || {
+  docker logs "$TEST_CONTAINER" 2>&1 | tail -10
+  fail "临时 MySQL 90 秒内没有就绪（上面是容器日志）"
+}
 
 # ---------- 2. 导入 ----------
-docker exec "$TEST_CONTAINER" mysql -uroot -pdrill-only-not-production \
-  -e "CREATE DATABASE $DB_NAME DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" >/dev/null 2>&1 \
-  || fail "创建演练库失败"
+if ! docker exec -e MYSQL_PWD="$DRILL_PASS" "$TEST_CONTAINER" mysql -uroot \
+      -e "CREATE DATABASE \`$DB_NAME\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" \
+      >/tmp/drill_create_err.txt 2>&1; then
+  fail "创建演练库失败：$(tr '\n' ' ' < /tmp/drill_create_err.txt | tail -c 300)"
+fi
 
-if ! gunzip -c "$LATEST" | docker exec -i "$TEST_CONTAINER" \
-      mysql -uroot -pdrill-only-not-production "$DB_NAME" >/tmp/drill_import_err.txt 2>&1; then
+if ! gunzip -c "$LATEST" | docker exec -e MYSQL_PWD="$DRILL_PASS" -i "$TEST_CONTAINER" \
+      mysql -uroot "$DB_NAME" >/tmp/drill_import_err.txt 2>&1; then
   fail "导入备份失败：$(tail -5 /tmp/drill_import_err.txt | tr '\n' ' ')"
 fi
 echo "导入完成"
@@ -93,9 +107,9 @@ echo "导入完成"
 MISMATCH=""
 for t in "${TABLES[@]}"; do
   SRC=$(docker exec -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$SRC_CONTAINER" mysql -uroot -N -B \
-        -e "SELECT COUNT(*) FROM $DB_NAME.$t" 2>/dev/null || echo "?")
-  DST=$(docker exec "$TEST_CONTAINER" mysql -uroot -pdrill-only-not-production -N -B \
-        -e "SELECT COUNT(*) FROM $DB_NAME.$t" 2>/dev/null || echo "?")
+        -e "SELECT COUNT(*) FROM \`$DB_NAME\`.\`$t\`" 2>/dev/null || echo "?")
+  DST=$(docker exec -e MYSQL_PWD="$DRILL_PASS" "$TEST_CONTAINER" mysql -uroot -N -B \
+        -e "SELECT COUNT(*) FROM \`$DB_NAME\`.\`$t\`" 2>/dev/null || echo "?")
   if [ "$SRC" = "?" ] || [ "$DST" = "?" ]; then
     MISMATCH="$MISMATCH\n  $t: 生产=$SRC 演练=$DST（查询失败）"
     continue
