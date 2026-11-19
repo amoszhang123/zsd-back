@@ -78,14 +78,21 @@ def _get_token(token: str) -> dict | None:
     # 升级前签发的 token 没有 pv 字段，同样作废 —— 放行等于给已泄露的会话
     # 留最多 12 小时的窗口。代价是上线后所有人重新登录一次，
     # 这在换密码的当口是应该的。
-    # 只对 web 会话校验密码指纹：小程序 token 没有 username（它靠 phone 绑定员工），
-    # 也没有"密码"这个概念，套用在这上面会把所有小程序用户踢下线。
-    username = info.get("username")
-    if username:
-        pv = info.get("pv")
-        user = USERS.get(username)
-        if not pv or not user or password_fingerprint(user["password"]) != pv:
-            return None
+    # 只对 web 会话校验密码指纹。
+    #
+    # 这里踩过一次坑：最早是靠「有没有 username」来区分，但小程序 token 的
+    # username 存的是手机号，被当成 web 会话拿去 USERS 里查，查不到就判定失效 ——
+    # 结果是「登录成功，下一个请求立刻被踢回登录页」，全员登不进小程序。
+    # 现在两边签发时都打了 kind，判定不再依赖字段猜测；
+    # 升级前签发的老 token 没有 kind，靠 role 兜底识别（小程序恒为 employee）。
+    kind = info.get("kind")
+    if kind == "mp" or (kind is None and info.get("role") == "employee"):
+        return info
+
+    pv = info.get("pv")
+    user = USERS.get(info.get("username", ""))
+    if not pv or not user or password_fingerprint(user["password"]) != pv:
+        return None
     return info
 
 
@@ -206,6 +213,10 @@ def _issue_session(username: str, user: dict) -> LoginResponse:
         "role": user["role"],
         "position": user["position"],
         "is_test": False,
+        # 会话类型标记。之前靠「有没有 username」区分 web 与小程序，
+        # 结果小程序的 username 是手机号，被当成 web 会话拿去校验密码指纹，
+        # 校验必然失败 → 登录后被立刻踢出去。现在两边显式打标记。
+        "kind": "web",
         # 密码指纹：改密码后这里对不上，旧 token 自动失效（不用维护吊销表）
         "pv": password_fingerprint(user["password"]),
         # 12 小时：车间公用电脑挂着登录过夜，等于整晚敞着门

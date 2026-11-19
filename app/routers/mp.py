@@ -312,6 +312,8 @@ def wx_login(req: WxLoginRequest):
 
     token = secrets.token_hex(24)
     _set_token(token, {               # 原来 TOKENS[token] = {...}
+        # kind=mp：小程序会话没有密码的概念，不能套用 web 的密码指纹校验
+        "kind": "mp",
         "username": phone,
         "name": phone,
         "role": "employee",
@@ -449,6 +451,8 @@ def sms_login(req: MpSmsLoginRequest):
 
     token = secrets.token_hex(24)
     _set_token(token, {
+        # kind=mp：小程序会话没有密码的概念，不能套用 web 的密码指纹校验
+        "kind": "mp",
         "username": phone,
         "name": phone,
         "role": "employee",
