@@ -92,7 +92,7 @@ echo "导入完成"
 # 差异超过 20% 才算异常，避免正常业务波动误报。
 MISMATCH=""
 for t in "${TABLES[@]}"; do
-  SRC=$(docker exec "$SRC_CONTAINER" mysql -uroot -p"${DB_ROOT_PASSWORD:-}" -N -B \
+  SRC=$(docker exec -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$SRC_CONTAINER" mysql -uroot -N -B \
         -e "SELECT COUNT(*) FROM $DB_NAME.$t" 2>/dev/null || echo "?")
   DST=$(docker exec "$TEST_CONTAINER" mysql -uroot -pdrill-only-not-production -N -B \
         -e "SELECT COUNT(*) FROM $DB_NAME.$t" 2>/dev/null || echo "?")

@@ -2,6 +2,22 @@
 
 > 出事时照着做，别临场想。**上线前必须演练一次**——第一次用它的时候不该是真正出事那天。
 
+## 零、先把密码读进变量（手册里所有命令都依赖它）
+
+`.env` 里的值不会自动变成 shell 变量，直接写 `-p"$DB_ROOT_PASSWORD"` 会得到空密码，
+然后 mysql 反过来问你要密码（`Enter password:`）——这就是第一次执行失败的原因。
+
+```bash
+cd /opt/zsd-back
+export DBPW=$(grep -E '^DB_PASSWORD=' .env | head -1 | cut -d= -f2- | tr -d '"')
+echo "${#DBPW}"      # 必须大于 0
+```
+
+后续命令一律用 `docker exec -e MYSQL_PWD="$DBPW" -i zsd-db mysql -uroot ...`：
+
+- 用 `MYSQL_PWD` 而不是 `-p$DBPW`，因为 `-p` 会把密码写进进程列表，
+  服务器上任何能执行 `ps` 的人都能看到。
+
 ## 先判断是哪一种
 
 | 症状 | 走哪条路 |
@@ -27,7 +43,7 @@ cd /opt/zsd-back && ./scripts/db_backup.sh
 或者在服务器上直接查：
 
 ```bash
-docker exec -it zsd-db mysql -uroot -p"$DB_ROOT_PASSWORD" factory_erp -e "
+docker exec -it zsd-db mysql -uroot -e MYSQL_PWD="$DB_ROOT_PASSWORD" factory_erp -e "
 SELECT created_at, user_name, module, target_label, summary
 FROM audit_logs
 WHERE action='delete'
@@ -46,8 +62,8 @@ ORDER BY created_at DESC LIMIT 20;"
 ### 2.1 确认 binlog 开着，找到时间点对应的文件
 
 ```bash
-docker exec zsd-db mysql -uroot -p"$DB_ROOT_PASSWORD" -e "SHOW VARIABLES LIKE 'log_bin';"
-docker exec zsd-db mysql -uroot -p"$DB_ROOT_PASSWORD" -e "SHOW BINARY LOGS;"
+docker exec zsd-db mysql -uroot -e MYSQL_PWD="$DB_ROOT_PASSWORD" -e "SHOW VARIABLES LIKE 'log_bin';"
+docker exec zsd-db mysql -uroot -e MYSQL_PWD="$DB_ROOT_PASSWORD" -e "SHOW BINARY LOGS;"
 ```
 
 按删除时间（比如 `2026-11-19 11:47`）选对应的文件名：
@@ -80,7 +96,7 @@ binlog 的 `ROW` 格式里，`### SET` 后面跟的就是被删的旧值：
 # 把 DELETE 事件转成 INSERT（binlog2sql 需要单独装，比手写安全得多）
 # 安装：pip3 install binlog2sql
 python3 -m binlog2sql \
-  -h 127.0.0.1 -P 3306 -u root -p"$DB_ROOT_PASSWORD" \
+  -h 127.0.0.1 -P 3306 -u root -e MYSQL_PWD="$DB_ROOT_PASSWORD" \
   -d factory_erp --start-file='binlog.000042' \
   --start-datetime='2026-11-19 11:40:00' --stop-datetime='2026-11-19 11:50:00' \
   -B > /tmp/rollback.sql
@@ -91,7 +107,7 @@ python3 -m binlog2sql \
 **执行前先在新起的事务里检查**：
 
 ```bash
-docker exec -i zsd-db mysql -uroot -p"$DB_ROOT_PASSWORD" factory_erp < /tmp/rollback.sql
+docker exec -i zsd-db mysql -uroot -e MYSQL_PWD="$DB_ROOT_PASSWORD" factory_erp < /tmp/rollback.sql
 # 再去页面确认那条单回来了，数据对不对
 ```
 
@@ -113,30 +129,30 @@ echo "使用备份：$LATEST"
 docker run -d --name zsd-recover -e MYSQL_ROOT_PASSWORD=temp123 --network none mysql:8.0
 # 等它就绪（约 20 秒）
 for i in $(seq 1 60); do
-  docker exec zsd-recover mysqladmin ping -uroot -ptemp123 --silent 2>/dev/null && break
+  docker exec -e MYSQL_PWD=temp123 zsd-recover mysqladmin ping -uroot --silent 2>/dev/null && break
   sleep 1
 done
 
-docker exec zsd-recover mysql -uroot -ptemp123 \
+docker exec -e MYSQL_PWD=temp123 zsd-recover mysql -uroot \
   -e "CREATE DATABASE factory_erp DEFAULT CHARACTER SET utf8mb4"
-gunzip -c "$LATEST" | docker exec -i zsd-recover mysql -uroot -ptemp123 factory_erp
+gunzip -c "$LATEST" | docker exec -e MYSQL_PWD=temp123 -i zsd-recover mysql -uroot factory_erp
 ```
 
 ### 3.2 在临时库里找到缺的数据，导出成 INSERT
 
 ```bash
 # 例如找回订单
-docker exec zsd-recover mysql -uroot -ptemp123 factory_erp -e "
+docker exec -e MYSQL_PWD=temp123 zsd-recover mysql -uroot factory_erp -e "
 SELECT * FROM orders WHERE id='WO80014AA'\G" | tee /tmp/row.txt
 ```
 
 确认无误后，用 `mysqldump` 只导这几行（最稳）：
 
 ```bash
-docker exec zsd-recover mysqldump -uroot -ptemp123 --no-create-info \
+docker exec -e MYSQL_PWD=temp123 zsd-recover mysqldump -uroot --no-create-info \
   --where="id='WO80014AA'" factory_erp orders > /tmp/one_row.sql
 cat /tmp/one_row.sql          # 看一眼
-docker exec -i zsd-db mysql -uroot -p"$DB_ROOT_PASSWORD" factory_erp < /tmp/one_row.sql
+docker exec -i zsd-db mysql -uroot -e MYSQL_PWD="$DB_ROOT_PASSWORD" factory_erp < /tmp/one_row.sql
 ```
 
 ### 3.3 用完删掉临时容器
@@ -161,14 +177,14 @@ cp -a /var/lib/docker/volumes/zsd-back_mysql_data /root/mysql_data_broken_$(date
 # 2) 起一个干净的 db 容器（保留 web）
 docker compose up -d db
 for i in $(seq 1 60); do
-  docker exec zsd-db mysqladmin ping -uroot -p"$DB_ROOT_PASSWORD" --silent 2>/dev/null && break
+  docker exec zsd-db mysqladmin ping -uroot -e MYSQL_PWD="$DB_ROOT_PASSWORD" --silent 2>/dev/null && break
   sleep 1
 done
 
 # 3) 导入最新备份
 LATEST=$(ls -1t backups/daily/*.sql.gz | head -1)
 echo "恢复自：$LATEST"
-gunzip -c "$LATEST" | docker exec -i zsd-db mysql -uroot -p"$DB_ROOT_PASSWORD"
+gunzip -c "$LATEST" | docker exec -i zsd-db mysql -uroot -e MYSQL_PWD="$DB_ROOT_PASSWORD"
 
 # 4) 起应用
 docker compose up -d web
@@ -216,7 +232,7 @@ tail -30 /var/log/db-backup.log
 /opt/zsd-back/scripts/db_restore_drill.sh
 
 # 看 binlog 是否开启、保留多久
-docker exec zsd-db mysql -uroot -p"$DB_ROOT_PASSWORD" -e "
+docker exec zsd-db mysql -uroot -e MYSQL_PWD="$DB_ROOT_PASSWORD" -e "
 SHOW VARIABLES LIKE 'log_bin';
 SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';
 SHOW BINARY LOGS;"

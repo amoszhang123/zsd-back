@@ -81,8 +81,10 @@ echo "=== $(date '+%F %T') 开始备份 $DB_NAME ==="
 # ---------- 1. 导出 ----------
 # 先写到 .tmp，校验通过再改名。避免半截文件被当成有效备份留在目录里。
 TMP="$FILE.tmp"
-docker exec "$CONTAINER" mysqldump \
-  -u"$BACKUP_USER" -p"$BACKUP_PASS" \
+# 密码走 MYSQL_PWD 环境变量而不是 -p：-p 会把密码暴露在 ps 里，
+# 服务器上任何能执行 ps 的人都能看到。MYSQL_PWD 不出现在进程列表。
+docker exec -e MYSQL_PWD="$BACKUP_PASS" "$CONTAINER" mysqldump \
+  -u"$BACKUP_USER" \
   --single-transaction --quick --routines --triggers --events \
   --default-character-set=utf8mb4 --no-tablespaces \
   "$DB_NAME" 2>/tmp/db_backup_err.txt | gzip > "$TMP"
