@@ -109,6 +109,25 @@ def init_db():
                 "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
             )
         conn.commit()
+    except pymysql.err.OperationalError as exc:
+        # 1044/1045 = 当前账号没有建库权限。
+        #
+        # 这是**正常配置**，不是故障：生产用的是最小权限账号（只授权到
+        # factory_erp.*），库由运维在部署时建好，应用只需要能读写这个库。
+        # 以前用 root 所以从未触发；换成专用账号后，如果这里抛出去，
+        # lifespan 失败会让整个服务起不来 —— 一个「没权限建库」把服务搞挂，
+        # 排查方向还容易跑偏到连接串和密码上。
+        #
+        # 库真的不存在时，后面的 create_all 会报错，那时错误信息更具体。
+        if exc.args and exc.args[0] in (1044, 1045):
+            import logging
+
+            logging.getLogger("uvicorn.error").info(
+                "当前账号无建库权限（属最小权限配置），跳过 CREATE DATABASE；"
+                "如首次部署请先用 root 建好库 %s", settings.db_name
+            )
+        else:
+            raise
     finally:
         conn.close()
 

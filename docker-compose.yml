@@ -8,11 +8,16 @@ services:
       --collation-server=utf8mb4_unicode_ci
       --default-authentication-plugin=mysql_native_password
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      # root 密码与应用账号密码必须分开：
+      #   DB_ROOT_PASSWORD —— root 的，只在建库/运维/部署备份时用
+      #   DB_PASSWORD      —— 应用账号（zsd_app）的，权限到 factory_erp.* 为止
+      # 之前两者共用一个变量，改应用密码会连带把 healthcheck 和 deploy.sh
+      # 的备份一起打挂（它们都用 root 连），而且报错看起来像"数据库连不上"。
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_PASSWORD}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_ROOT_PASSWORD}"]
       interval: 10s
       timeout: 5s
       retries: 10
