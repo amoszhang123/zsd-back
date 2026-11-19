@@ -1,11 +1,12 @@
 from datetime import date, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.routers.auth import _get_token
 from app.database import get_db
 from app.models.contract import Contract, ContractItem
 from app.models.order import SHIPPING_STEP, Order, OrderStep, resolve_order_status
@@ -28,6 +29,25 @@ from app.schemas.shipment import (
 from app.statement import render_statement
 
 router = APIRouter(prefix="/api/shipments", tags=["shipments"])
+
+# 对账单是唯一一个「浏览器直接打开 URL」的接口（新标签页打印），
+# <a>/window.open 发的请求带不了 Authorization 头，所以它单独放行，
+# 改为接受 ?token= 查询参数。其余接口一律走统一鉴权（见 main.py）。
+public_router = APIRouter(prefix="/api/shipments", tags=["shipments"])
+
+
+def _require_print_token(raw: str) -> dict:
+    """打印页鉴权：header 里的 Bearer 或 URL 上的 ?token= 都认。
+
+    为什么不直接放进白名单：对账单上有客户名、项目号、金额，
+    裸奔等于把客户台账公开。URL 里带 token 会被浏览器历史和反代日志记录，
+    但它是一次性打开的打印页，权衡下来比开放整个接口可接受。
+    """
+    token = (raw or "").replace("Bearer ", "").strip()
+    info = _get_token(token) if token else None
+    if not info:
+        raise HTTPException(401, "未登录或链接已过期，请重新从出货管理打开")
+    return info
 
 QC2_STAGE = "quality2"
 QC2_VERDICT_PASS = "pass"
@@ -673,11 +693,13 @@ def _statement_rows(db: Session, shipments: list[Shipment]) -> list[dict]:
     return rows
 
 
-@router.get("/{shipment_id}/statement", response_class=HTMLResponse)
+@public_router.get("/{shipment_id}/statement", response_class=HTMLResponse)
 def print_statement(
     shipment_id: int,
     scope: str = "month",
     title: str | None = None,
+    token: str = Query(default=""),
+    authorization: str = Header(default=""),
     db: Session = Depends(get_db),
 ):
     """客户对账单。scope=month 把该客户当月所有送货单拼成一张，scope=single 只本单。
@@ -689,9 +711,11 @@ def print_statement(
     对账要跟客户手上的纸对得上。ship_date 为空的老单退回 created_at，与
     backfill_ship_date 的补值一致。
 
-    这个页面允许不带 token 打开：预览是「新标签页直达 URL」，页面本身改不了任何
-    数据，和送货单打印页（GET /{id}/print）一个口径。
+    鉴权：这个页面是「新标签页直达 URL」打开的，浏览器带不了 Authorization 头，
+    所以接受 ?token= 参数（或 header 里的 Bearer）。对账单含客户名与金额，
+    不能像以前那样放开。
     """
+    _require_print_token(token or authorization)
     anchor = db.query(Shipment).filter(Shipment.id == shipment_id).first()
     if not anchor:
         raise HTTPException(404, f"出货记录单不存在: #{shipment_id}")

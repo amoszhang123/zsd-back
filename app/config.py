@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     # 换密钥后所有已出示的二维码立即失效，员工端下次刷新会拿到新的，无需迁移。
     qr_secret: str = "factory_qr_secret"
 
+    # —— 安全相关 ——
+    # web 登录账号。格式：用户名:密码哈希:姓名:角色:岗位，多个用 ; 分隔。
+    # 密码哈希用 `python -m app.make_password <明文>` 生成。
+    # 不配则回落到内置默认账号（admin/admin123），启动日志会警告 —— 生产必须配。
+    web_users: str = ""
+
+    # 允许跨域访问的前端地址，逗号分隔。留空则只允许同源与本地调试地址。
+    # 之前是 ["*"]，等于任何网站都能在浏览器里直接调后端。
+    cors_origins: str = ""
+
     ship_from_company: str = "苏州展晟达精密科技有限公司"
 
     @property

@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -6,7 +7,16 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from app.config import settings
+from app.security import (
+    is_hashed,
+    login_throttle,
+    parse_users,
+    password_fingerprint,
+    verify_password,
+)
+
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from pydantic import BaseModel
 
 from app.qr_image import render_qr_data_uri
@@ -15,10 +25,18 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 # position 是员工管理里的工种：web 模块可见性按工种配置（见 routers/permissions.py），
 # 登录账号在这里绑定一个工种，token 里带上它，前端据此拉可见模块。
-USERS = {
+# 账号从 .env 的 WEB_USERS 读，密码存 scrypt 哈希（见 app/security.py）。
+# 没配时回落到这套内置默认 —— 不是鼓励用默认密码，而是避免「漏配一个环境变量
+# 就登不进后台」这种更难排查的故障；启动日志会明确警告。
+DEFAULT_USERS = {
     "admin": {"password": "admin123", "name": "管理员", "role": "admin", "position": "管理员"},
     "operator": {"password": "123456", "name": "操作员", "role": "operator", "position": "操作工"},
 }
+
+USERS: dict[str, dict] = parse_users(settings.web_users) or dict(DEFAULT_USERS)
+USING_DEFAULT_USERS = not settings.web_users.strip()
+# 明文密码只在本地开发时容忍：哈希格式固定以 scrypt$ 开头
+PLAINTEXT_USERS = [u for u, v in USERS.items() if not is_hashed(v["password"])]
 
 # token 落到共享文件：多个 gunicorn worker 读写同一份，重启也不丢。
 # 用 os.replace 原子替换，避免并发写坏文件；expires 存 ISO 字符串（JSON 不能存 datetime）。
@@ -56,6 +74,18 @@ def _get_token(token: str) -> dict | None:
         return None
     if info.get("expires", "") < datetime.now().isoformat():
         return None
+    # 密码改过之后旧 token 全部作废：指纹不一致就当没登录。
+    # 升级前签发的 token 没有 pv 字段，同样作废 —— 放行等于给已泄露的会话
+    # 留最多 12 小时的窗口。代价是上线后所有人重新登录一次，
+    # 这在换密码的当口是应该的。
+    # 只对 web 会话校验密码指纹：小程序 token 没有 username（它靠 phone 绑定员工），
+    # 也没有"密码"这个概念，套用在这上面会把所有小程序用户踢下线。
+    username = info.get("username")
+    if username:
+        pv = info.get("pv")
+        user = USERS.get(username)
+        if not pv or not user or password_fingerprint(user["password"]) != pv:
+            return None
     return info
 
 
@@ -86,12 +116,48 @@ class UserInfo(BaseModel):
 
 
 @router.post("/login", response_model=LoginResponse)
-def login(req: LoginRequest):
+def login(req: LoginRequest, request: Request):
+    """账号密码登录。
+
+    失败一律报同一句话，不区分「账号不存在」和「密码错」—— 分开报等于告诉别人
+    哪些账号是真的。失败计数按 IP 与账号分别累计，任一超限就锁 5 分钟。
+    """
+    ip = _client_ip(request)
+    wait = login_throttle.blocked_for(ip, req.username)
+    if wait:
+        raise HTTPException(
+            429,
+            f"密码错误次数太多，请 {max(1, wait // 60)} 分钟后再试",
+            headers={"Retry-After": str(wait)},
+        )
+
     user = USERS.get(req.username)
-    if not user or user["password"] != req.password:
+    stored = user["password"] if user else ""
+    if is_hashed(stored):
+        ok = verify_password(req.password, stored)
+    else:
+        # 明文只在本地开发/漏配 WEB_USERS 时出现（启动日志会警告），
+        # 仍用定长比较，避免按字符提前返回泄露时序
+        ok = bool(stored) and hmac.compare_digest(req.password, stored)
+    if not ok:
+        login_throttle.record_failure(ip, req.username)
         raise HTTPException(401, "用户名或密码错误")
+
+    login_throttle.clear(ip, req.username)
     # 会话签发与扫码登录共用 _issue_session，两种方式拿到的 token 完全同构
     return _issue_session(req.username, user)
+
+
+def _client_ip(request: Request) -> str:
+    """取真实客户端 IP。
+
+    生产在 nginx 后面，request.client 拿到的是反代地址，必须读
+    X-Forwarded-For 的第一段；没有反代（本地直连）时回落到 socket 地址。
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 @router.get("/me", response_model=UserInfo)
@@ -140,7 +206,10 @@ def _issue_session(username: str, user: dict) -> LoginResponse:
         "role": user["role"],
         "position": user["position"],
         "is_test": False,
-        "expires": (datetime.now() + timedelta(hours=24)).isoformat(),
+        # 密码指纹：改密码后这里对不上，旧 token 自动失效（不用维护吊销表）
+        "pv": password_fingerprint(user["password"]),
+        # 12 小时：车间公用电脑挂着登录过夜，等于整晚敞着门
+        "expires": (datetime.now() + timedelta(hours=12)).isoformat(),
     })
     return LoginResponse(
         token=token, name=user["name"], role=user["role"], position=user["position"]
