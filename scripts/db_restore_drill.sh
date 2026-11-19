@@ -27,7 +27,18 @@ get_env() {
 
 BACKUP_DIR="${BACKUP_DIR:-$APP_DIR/backups}"
 DB_NAME="${DB_NAME:-$(get_env DB_NAME factory_erp)}"
-DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-$(get_env DB_PASSWORD)}"
+
+# 读生产库行数用哪个账号：
+#   优先应用账号（DB_USER/DB_PASSWORD）—— 它必然有 SELECT 且是应用天天在用的，
+#   最不容易错。早期版本直接拿 DB_PASSWORD 当 root 密码用，换成专用账号后
+#   就永远 Access denied，八张表全变 "?"，看起来像「备份不完整」，实际是连不上。
+#   只有 DB_USER=root 时才去用 DB_ROOT_PASSWORD。
+SRC_USER="${SRC_USER:-$(get_env DB_USER root)}"
+if [ "$SRC_USER" = "root" ]; then
+  SRC_PASS="${SRC_PASS:-$(get_env DB_ROOT_PASSWORD "$(get_env DB_PASSWORD)")}"
+else
+  SRC_PASS="${SRC_PASS:-$(get_env DB_PASSWORD)}"
+fi
 SRC_CONTAINER="${DB_CONTAINER:-zsd-db}"
 TEST_CONTAINER="zsd-restore-drill"
 # 复用生产在用的镜像：本地一定已经拉过，避免临时容器因拉镜像失败/太慢而起不来。
@@ -57,6 +68,7 @@ $1
 TABLES=(orders contracts shipments cost_records cash_entries revenue_records employees attendance_records)
 
 echo "=== $(date '+%F %T') 恢复演练开始 ==="
+echo "生产库对比账号：$SRC_USER（读 ${DB_NAME} 的行数）"
 
 LATEST=$(ls -1t "$BACKUP_DIR/daily/"*.sql.gz 2>/dev/null | head -1)
 [ -n "$LATEST" ] || fail "找不到任何备份文件（$BACKUP_DIR/daily 为空）"
@@ -106,12 +118,12 @@ echo "导入完成"
 # 差异超过 20% 才算异常，避免正常业务波动误报。
 MISMATCH=""
 for t in "${TABLES[@]}"; do
-  SRC=$(docker exec -e MYSQL_PWD="$DB_ROOT_PASSWORD" "$SRC_CONTAINER" mysql -uroot -N -B \
+  SRC=$(docker exec -e MYSQL_PWD="$SRC_PASS" "$SRC_CONTAINER" mysql -u"$SRC_USER" -N -B \
         -e "SELECT COUNT(*) FROM \`$DB_NAME\`.\`$t\`" 2>/dev/null || echo "?")
   DST=$(docker exec -e MYSQL_PWD="$DRILL_PASS" "$TEST_CONTAINER" mysql -uroot -N -B \
         -e "SELECT COUNT(*) FROM \`$DB_NAME\`.\`$t\`" 2>/dev/null || echo "?")
   if [ "$SRC" = "?" ] || [ "$DST" = "?" ]; then
-    MISMATCH="$MISMATCH\n  $t: 生产=$SRC 演练=$DST（查询失败）"
+    MISMATCH="$MISMATCH"$'\n'"  $t: 生产=$SRC 演练=$DST（查询失败）"
     continue
   fi
   echo "  $t: 生产 $SRC / 演练 $DST"
@@ -119,7 +131,7 @@ for t in "${TABLES[@]}"; do
     DIFF=$(( SRC - DST ))
     # 演练库比生产还多 → 不正常；少超过 20% → 不正常
     if [ "$DST" -gt "$SRC" ] || [ "$DIFF" -gt $(( SRC / 5 )) ]; then
-      MISMATCH="$MISMATCH\n  $t: 生产=$SRC 演练=$DST"
+      MISMATCH="$MISMATCH"$'\n'"  $t: 生产=$SRC 演练=$DST"
     fi
   fi
 done
