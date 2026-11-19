@@ -20,6 +20,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db, scoped
 from app.machine_label import MachineLabelData, render_machine_label
 from app.models.production import (
@@ -162,6 +163,12 @@ def create_machine(req: MachineCreate, db: Session = Depends(get_db)):
             id=_next_machine_code(db), name=name, model=(req.model or "").strip()
         )
         db.add(machine)
+        audit.record(
+            db, action="create", module="machines",
+            target_id=machine.id, target_label=f"机台 {machine.name}（{machine.id}）",
+            summary=f"新增机台：{machine.name}"
+                    + (f"（{machine.model}）" if machine.model else ""),
+        )
         try:
             db.commit()
         except IntegrityError:
@@ -178,6 +185,7 @@ def create_machine(req: MachineCreate, db: Session = Depends(get_db)):
 def update_machine(machine_id: str, req: MachineUpdate, db: Session = Depends(get_db)):
     machine = _get_machine(db, machine_id)
 
+    before = {"name": machine.name, "model": machine.model, "active": machine.active}
     if req.name is not None:
         name = req.name.strip()
         if not name:
@@ -188,6 +196,17 @@ def update_machine(machine_id: str, req: MachineUpdate, db: Session = Depends(ge
     if req.active is not None:
         machine.active = req.active
 
+    diff = audit.changes_of(
+        before,
+        {"name": machine.name, "model": machine.model, "active": machine.active},
+        {"name": "名称", "model": "型号", "active": "启用"},
+    )
+    if diff:
+        audit.record(
+            db, action="update", module="machines",
+            target_id=machine.id, target_label=f"机台 {machine.name}（{machine.id}）",
+            summary=audit.describe(diff), changes=diff,
+        )
     db.commit()
     db.refresh(machine)
     return _to_out(machine, _stats_map(db, [machine.id]).get(machine.id, {}))

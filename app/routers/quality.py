@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
+from app import audit
 from app.database import get_db, scoped
 from app.models.order import (
     ORDER_TYPE_FULL_OUTSOURCE,
@@ -220,6 +221,13 @@ def _create_disposition(
     db.add(doc)
     db.flush()
     _save_owners(db, doc_type, doc.id, owners)
+    audit.record(
+        db, action="create", module="quality",
+        target_id=str(doc.id),
+        target_label=f"{TYPE_LABELS[doc_type]} #{doc.id}（订单 {order.id}）",
+        summary=f"新建{TYPE_LABELS[doc_type]}：订单 {order.id}，{doc.quantity:g} 件，"
+                f"{len(owners)} 名责任人",
+    )
     db.commit()
     db.refresh(doc)
     return _to_out(doc, doc_type, _owners_map(db, doc_type, [doc.id]).get(doc.id, []))
@@ -267,7 +275,15 @@ def _update_status(
     if not doc:
         raise HTTPException(404, f"{TYPE_LABELS[doc_type]}不存在: #{doc_id}")
     if doc.status != req.status:
+        old_status = doc.status
         doc.status = req.status
+        audit.record(
+            db, action="update", module="quality",
+            target_id=str(doc.id),
+            target_label=f"{TYPE_LABELS[doc_type]} #{doc.id}（订单 {doc.order_id}）",
+            summary=f"{TYPE_LABELS[doc_type]}状态：{old_status} → {req.status}",
+            changes=[{"field": "status", "label": "状态", "before": old_status, "after": req.status}],
+        )
         db.commit()
         db.refresh(doc)
     return _to_out(doc, doc_type, _owners_map(db, doc_type, [doc.id]).get(doc.id, []))
@@ -320,12 +336,31 @@ def update_disposition_losses(
             f"{names} 不是{TYPE_LABELS[doc_type]} #{doc_id} 的负责人，不能通过此接口增删负责人",
         )
 
+    _loss_labels = {"labor_hours": "工时", "material_cost": "物料损失"}
+    changes = []
     for o in req.owners:
         row = by_emp[o.employee_id]
+        if row.labor_hours != o.labor_hours:
+            changes.append({
+                "field": f"{o.employee_id}.labor_hours", "label": f"{o.employee_id} 工时",
+                "before": row.labor_hours, "after": o.labor_hours,
+            })
+        if float(row.material_cost or 0) != float(o.material_cost or 0):
+            changes.append({
+                "field": f"{o.employee_id}.material_cost", "label": f"{o.employee_id} 物料损失",
+                "before": row.material_cost, "after": o.material_cost,
+            })
         row.labor_hours = o.labor_hours
         row.material_cost = o.material_cost
         row.updated_at = datetime.now()
 
+    if changes:
+        audit.record(
+            db, action="update", module="quality",
+            target_id=str(doc.id),
+            target_label=f"{TYPE_LABELS[doc_type]} #{doc.id}（订单 {doc.order_id}）",
+            summary=audit.describe(changes), changes=changes,
+        )
     db.commit()
     db.refresh(doc)
     return _to_out(doc, doc_type, _owners_map(db, doc_type, [doc.id]).get(doc.id, []))
@@ -572,6 +607,14 @@ def submit_judgment(req: QcJudgmentRequest, db: Session = Depends(get_db)):
     elif verdict == "pass" and order.current_step == STAGE_STEP[req.stage]:
         advance_order_to(order, NEXT_STEP[req.stage])
 
+    audit.record(
+        db, action="approve", module="quality",
+        target_id=str(order.id),
+        target_label=f"质检 {STAGE_LABELS[req.stage]} {order.id}",
+        summary=f"{STAGE_LABELS[req.stage]}判定{VERDICT_LABELS[verdict]}：送检 {inspected} 件"
+                + (f"，报废 {req.scrap_qty} 件" if req.scrap_qty else "")
+                + ("，整批打回投产" if returned else ""),
+    )
     db.commit()
 
     left = max(0, pending - inspected)

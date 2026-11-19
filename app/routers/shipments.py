@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.routers.auth import _get_token
+from app import audit
 from app.database import get_db
 from app.models.contract import Contract, ContractItem
 from app.models.order import SHIPPING_STEP, Order, OrderStep, resolve_order_status
@@ -439,6 +440,15 @@ def create_shipment(req: ShipmentCreate, db: Session = Depends(get_db)):
         elif step and step.status != "completed":
             step.status = "processing"
 
+    if created:
+        audit.record(
+            db, action="create", module="shipments",
+            target_id=str(created[0].id),
+            target_label=f"送货单 {created[0].doc_no}"
+                        + (f" 等 {len(created)} 张" if len(created) > 1 else ""),
+            summary=f"新建出货：合同 {req.contract_id}，"
+                    f"{len(created)} 张送货单，共 {sum(len(s.items) for s in created)} 个工单",
+        )
     db.commit()
     for shipment in created:
         db.refresh(shipment)
@@ -481,10 +491,22 @@ def update_ship_date(shipment_id: int, payload: ShipmentDateUpdate, db: Session 
     if not shipment:
         raise HTTPException(404, f"出货记录单不存在: #{shipment_id}")
 
+    old_date, old_doc_no = shipment.ship_date, shipment.doc_no
     changed = shipment.ship_date != payload.ship_date
     shipment.ship_date = payload.ship_date
     if changed:
         shipment.doc_no = _next_doc_no(db, payload.ship_date)
+        # 改出货日期会连带重编单号，是对账相关的高危操作，必须留痕
+        audit.record(
+            db, action="update", module="shipments",
+            target_id=str(shipment.id),
+            target_label=f"送货单 {old_doc_no}",
+            summary=f"改出货日期：{old_date} → {payload.ship_date}，单号 {old_doc_no} → {shipment.doc_no}",
+            changes=[
+                {"field": "ship_date", "label": "出货日期", "before": old_date, "after": payload.ship_date},
+                {"field": "doc_no", "label": "单号", "before": old_doc_no, "after": shipment.doc_no},
+            ],
+        )
     db.commit()
     db.refresh(shipment)
     return _to_out(shipment, _unit_price_map(db, [shipment]))

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db, scoped
 from app.models.contract import blocked_orders
 from app.models.order import ORDER_STATUS_LABELS, PRODUCTION_STEP, QUALITY1_STEP, Order
@@ -249,6 +250,13 @@ def start_work(req: StartWorkRequest, db: Session = Depends(get_db)):
         WorkOrderItem(order_id=oid, machine_id=machine_map.get(oid)) for oid in order_ids
     ]
     db.add(work_order)
+    db.flush()
+    audit.record(
+        db, action="create", module="production",
+        target_id=str(work_order.id), target_label=f"开工单 {work_order.code}",
+        summary=f"开工：{len(employee_ids)} 名员工、{len(order_ids)} 个订单（{', '.join(order_ids[:3])}"
+                + ("…" if len(order_ids) > 3 else "") + "）",
+    )
 
     db.commit()
     db.refresh(work_order)
@@ -354,6 +362,12 @@ def complete_work(req: CompleteWorkRequest, db: Session = Depends(get_db)):
 
     work_order.status = WORK_ORDER_STATUS_DONE
     work_order.completed_at = datetime.now()
+    audit.record(
+        db, action="approve", module="production",
+        target_id=str(work_order.id), target_label=f"开工单 {work_order.code}",
+        summary=f"完工提交：开工单 {work_order.code}，完成 {len(newly_done)} 个订单"
+                + (f"（{', '.join(newly_done[:3])}{'…' if len(newly_done) > 3 else ''}）" if newly_done else ""),
+    )
     db.commit()
     db.refresh(work_order)
 

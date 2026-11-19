@@ -21,6 +21,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db
 from app.material_label import MaterialLabelData, label_png, render_label_sheet
 from app.models.cost import CostRecord
@@ -228,6 +229,14 @@ def list_materials(db: Session = Depends(get_db)):
     return MaterialListOut(rows=rows, summary=summary)
 
 
+# 字段中文名，日志给人看
+_MAT_LABELS = {
+    "name": "名称", "spec": "规格", "unit": "单位", "category": "类别",
+    "location": "库位", "warn_threshold": "预警阈值", "remark": "备注",
+    "active": "启用", "must_return": "需归还",
+}
+
+
 @router.post("", response_model=MaterialOut)
 def create_material(req: MaterialCreate, db: Session = Depends(get_db)):
     """建档，库存固定 0。贴标签和入库解耦：先把码贴上料架，等采购到货再纳库存。"""
@@ -241,6 +250,13 @@ def create_material(req: MaterialCreate, db: Session = Depends(get_db)):
     for attempt in range(3):
         try:
             db.add(material)
+            db.flush()
+            audit.record(
+                db, action="create", module="materials",
+                target_id=str(material.id),
+                target_label=f"物料 {material.code} {material.name}",
+                summary=f"新建物料：{material.code} {material.name}（{material.unit}）",
+            )
             db.commit()
             break
         except IntegrityError:
@@ -257,11 +273,23 @@ def update_material(
     material_id: int, req: MaterialUpdate, db: Session = Depends(get_db)
 ):
     material = _get_material(db, material_id)
-    for field, value in req.model_dump(exclude_unset=True).items():
+    update_data = req.model_dump(exclude_unset=True)
+    before = {k: getattr(material, k, None) for k in update_data}
+    for field, value in update_data.items():
         if field == "warn_threshold" and value is not None:
             setattr(material, field, _d(value))
         else:
             setattr(material, field, value)
+    diff = audit.changes_of(
+        before, {k: getattr(material, k, None) for k in update_data}, _MAT_LABELS
+    )
+    if diff:
+        audit.record(
+            db, action="update", module="materials",
+            target_id=str(material.id),
+            target_label=f"物料 {material.code} {material.name}",
+            summary=audit.describe(diff), changes=diff,
+        )
     db.commit()
     db.refresh(material)
     return _material_out(material, _pending_map(db))
@@ -306,6 +334,12 @@ def stock_in(req: StockInRequest, db: Session = Depends(get_db)):
         ref_type="cost_record", ref_id=record.id, ref_no=f"成本 #{record.id}",
         remark=req.remark or f"采购纳入：{record.category} {record.spec}".strip(),
     )
+    audit.record(
+        db, action="update", module="materials",
+        target_id=str(material.id),
+        target_label=f"物料 {material.code} {material.name}",
+        summary=f"采购入库：{material.name} +{_f(qty)}{material.unit}（成本 #{record.id}）",
+    )
     db.commit()
     db.refresh(material)
     return _material_out(material, _pending_map(db))
@@ -337,6 +371,12 @@ def revoke_stock_in(cost_record_id: int, db: Session = Depends(get_db)):
     record.material_id = None
     record.stocked_qty = None
     record.stocked_at = None
+    audit.record(
+        db, action="cancel", module="materials",
+        target_id=str(material.id),
+        target_label=f"物料 {material.code} {material.name}",
+        summary=f"撤销入库：{material.name} -{_f(qty)}{material.unit}（成本 #{record.id}）",
+    )
     db.commit()
     db.refresh(material)
     return _material_out(material, _pending_map(db))
@@ -502,6 +542,12 @@ def create_issue(req: IssueCreate, db: Session = Depends(get_db)):
             employee=employee, remark=req.remark,
         )
 
+    audit.record(
+        db, action="create", module="materials",
+        target_id=str(order.id), target_label=f"领料单 {order.order_no}",
+        summary=f"物料领用：{len(merged)} 种，共 {_f(sum(merged.values()))} 件"
+                + (f"，领料人 {employee.name}" if employee else ""),
+    )
     db.commit()
     db.refresh(order)
     return _issue_out(order, _issue_items_out(db, [order]).get(order.id, []))
@@ -612,6 +658,12 @@ def return_issue(issue_id: int, req: ReturnRequest, db: Session = Depends(get_db
         order.status = ISSUE_CLOSED
         order.returned_at = datetime.now()
 
+    audit.record(
+        db, action="update", module="materials",
+        target_id=str(order.id), target_label=f"领料单 {order.order_no}",
+        summary=f"物料归还：领料单 {order.order_no}"
+                + ("，已全部结清" if order.status == ISSUE_CLOSED else "，部分归还"),
+    )
     db.commit()
     db.refresh(order)
     return _issue_out(order, _issue_items_out(db, [order]).get(order.id, []))
@@ -650,6 +702,12 @@ def scrap_stock(req: StockScrapRequest, db: Session = Depends(get_db)):
         db, material, MOVE_SCRAP, qty, d_stock=-qty, d_scrapped=qty,
         ref_type="scrap_order", ref_id=order.id, ref_no=order.order_no,
         remark=f"库存报废：{req.reason.strip()}",
+    )
+    audit.record(
+        db, action="update", module="materials",
+        target_id=str(material.id),
+        target_label=f"物料 {material.code} {material.name}",
+        summary=f"库存报废：{material.name} -{_f(qty)}{material.unit}，原因：{req.reason.strip()}",
     )
     db.commit()
     db.refresh(order)

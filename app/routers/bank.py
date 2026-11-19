@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db
 from app.models.bank import BankStatement, BankTransaction
 from app.schemas.bank import (
@@ -126,6 +127,13 @@ def import_statement(payload: BankImport, db: Session = Depends(get_db)):
     )
     db.add(statement)
     db.flush()
+    audit.record(
+        db, action="import", module="bank",
+        target_id=str(statement.id),
+        target_label=f"对账单 {statement.account_name or statement.account_no} {statement.period_start}~{statement.period_end}",
+        summary=f"导入对账单：{statement.account_name or statement.account_no} "
+                f"新增 {len(fresh)} 条流水、跳过 {skipped} 条重复",
+    )
 
     for tx in fresh:
         db.add(
@@ -262,6 +270,13 @@ def delete_statement(statement_id: int, db: Session = Depends(get_db)):
     if not statement:
         raise HTTPException(404, f"导入批次不存在: #{statement_id}")
     deleted = len(statement.transactions)
+    audit.record(
+        db, action="delete", module="bank",
+        target_id=str(statement_id),
+        target_label=f"对账单 {statement.account_name or statement.account_no} {statement.period_start}~{statement.period_end}",
+        summary=f"删除对账单导入批次：{statement.account_name or statement.account_no}，"
+                f"同时移除 {deleted} 条流水",
+    )
     db.delete(statement)
     db.commit()
     return {"deleted": statement_id, "transactions_removed": deleted}
