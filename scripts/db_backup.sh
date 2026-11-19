@@ -101,10 +101,21 @@ if ! gzip -t "$TMP" 2>/dev/null; then
   fail "备份文件损坏（gzip 校验失败），可能是磁盘写满或被中断"
 fi
 # 2b. mysqldump 的结束标记：只有正常跑完才会写这行
-if ! tail -c 200 "$TMP" | gunzip 2>/dev/null | grep -q "Dump completed"; then
-  rm -f "$TMP"
-  fail "备份文件缺少 'Dump completed' 标记，导出未正常结束"
-fi
+#
+# 两个坑都在这里踩过：
+#   * 不能对 .gz 用 tail -c —— gzip 是流式压缩，从中间截一段解不出来，
+#     必须完整解压后取尾部。
+#   * 不能用 `| grep -q`：grep 命中即退出，上游 gunzip 收到 SIGPIPE，
+#     配合 set -o pipefail 会让整条管道返回 141，if 一取反就成了「校验失败」。
+#     改先把尾部取进变量再匹配，不依赖管道状态。
+LAST_LINES=$(gunzip -c "$TMP" 2>/dev/null | tail -n 10)
+case "$LAST_LINES" in
+  *"Dump completed"*) ;;
+  *)
+    rm -f "$TMP"
+    fail "备份文件缺少 'Dump completed' 标记，导出未正常结束"
+    ;;
+esac
 # 2c. 体积下限：正常库不可能小于 10KB，太小说明导了个空
 SIZE=$(stat -c%s "$TMP" 2>/dev/null || stat -f%z "$TMP")
 if [ "$SIZE" -lt 10240 ]; then
