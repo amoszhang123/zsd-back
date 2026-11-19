@@ -28,6 +28,7 @@ from app.models.inventory import (
 )
 from app.models.bank import BankStatement, BankTransaction
 from app.models.cash import CashEntry, CashVoucher
+from app.models.audit import AuditLog
 from app.models.attendance import (
     AttendanceRecord,
     AttendanceSettings,
@@ -52,6 +53,7 @@ __all__ = [
     "BankStatement", "BankTransaction",
     "CashEntry", "CashVoucher",
     "AttendanceRecord", "AttendanceSettings", "LeaveBalance", "LeaveRequest", "LeaveType",
+    "AuditLog",
     "RevenueRecord",
     "PositionModulePermission",
 ]

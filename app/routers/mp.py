@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, HTTPException, Header, Response, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Header, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
@@ -232,11 +232,19 @@ def _mint_qr_token(emp: Employee, ts: int) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:QR_TOKEN_LEN]
 
 
-def _get_mp_user(authorization: str = Header("")):
+def _get_mp_user(
+    request: Request,
+    authorization: str = Header(""),
+    db: Session = Depends(get_db),
+):
     token = authorization.replace("Bearer ", "")
     info = _get_token(token)
     if not info:
         raise HTTPException(401, "未登录")
+    # 小程序的写操作同样要留痕：谁在手机上改了完工数量、报了损耗、批了假
+    from app.routers.auth import _remember_actor
+
+    _remember_actor(db, info, request, kind="mp")
     return info
 
 

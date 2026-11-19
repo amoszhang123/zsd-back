@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db, scoped
 from app.invoice_storage import (
     VOUCHER_DIR,
@@ -93,10 +94,32 @@ def list_cash_entries(db: Session) -> list[CashEntryOut]:
     return [_to_out(r, grouped.get(r.id)) for r in rows]
 
 
+# 库里的 direction 是 in/out，日志要给人看，转成中文
+_CASH_DIR_LABELS = {"in": "收入", "out": "支出"}
+
+
+def _dir_cn(value: str) -> str:
+    return _CASH_DIR_LABELS.get(value, value)
+
+
+_CASH_LABELS = {
+    "direction": "收/付", "category": "类别", "amount": "金额",
+    "counterparty": "往来单位", "remark": "备注", "entry_date": "日期",
+}
+
+
 def create_cash_entry(req: CashEntryIn, db: Session) -> CashEntryOut:
     """新建一笔收付款。web 与小程序共用（小程序那边只多一道管理员校验）。"""
     entry = CashEntry(**req.model_dump())
     db.add(entry)
+    db.flush()  # 先拿到自增 id，审计要用它做 target_id
+    audit.record(
+        db, action="create", module="cash",
+        target_id=str(entry.id),
+        target_label=f"{_dir_cn(entry.direction)} {entry.category} ¥{entry.amount:g}",
+        summary=f"新增{_dir_cn(entry.direction)}：{entry.category} ¥{entry.amount:g}"
+                + (f"（{entry.counterparty}）" if entry.counterparty else ""),
+    )
     db.commit()
     db.refresh(entry)
     return _to_out(entry)
@@ -104,8 +127,20 @@ def create_cash_entry(req: CashEntryIn, db: Session) -> CashEntryOut:
 
 def update_cash_entry(entry: CashEntry, req: CashEntryUpdate, db: Session) -> CashEntryOut:
     """部分更新：只改传了值的字段（靠 exclude_unset 区分「没传」和「传了空」）。"""
-    for field, value in req.model_dump(exclude_unset=True).items():
+    update_data = req.model_dump(exclude_unset=True)
+    before = {k: getattr(entry, k, None) for k in update_data}
+    for field, value in update_data.items():
         setattr(entry, field, value)
+    changes = audit.changes_of(
+        before, {k: getattr(entry, k, None) for k in update_data}, _CASH_LABELS
+    )
+    if changes:
+        audit.record(
+            db, action="update", module="cash",
+            target_id=str(entry.id),
+            target_label=f"{_dir_cn(entry.direction)} {entry.category} ¥{entry.amount:g}",
+            summary=audit.describe(changes), changes=changes,
+        )
     db.commit()
     db.refresh(entry)
     return _to_out(entry, vouchers_of(db, [entry.id]).get(entry.id))
@@ -119,6 +154,12 @@ def delete_cash_entry(entry: CashEntry, db: Session) -> int:
     """
     # 主键先取出来：commit 之后对象会过期，行又已经删了，再读 entry.id 会抛 ObjectDeletedError
     entry_id = entry.id
+    audit.record(
+        db, action="delete", module="cash",
+        target_id=str(entry_id),
+        target_label=f"{_dir_cn(entry.direction)} {entry.category} ¥{entry.amount:g}",
+        summary=f"删除{_dir_cn(entry.direction)}：{entry.category} ¥{entry.amount:g}（{entry.entry_date}）",
+    )
     paths = [
         v.file_path
         for v in db.query(CashVoucher).filter(CashVoucher.entry_id == entry_id).all()

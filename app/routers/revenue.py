@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db, scoped
 from app.models.contract import ContractItem
 from app.models.revenue import RevenueRecord
@@ -181,6 +182,13 @@ def confirm_revenue(req: RevenueConfirmIn, db: Session) -> RevenueOut:
         remark=req.remark,
     )
     db.add(record)
+    db.flush()
+    audit.record(
+        db, action="approve", module="revenue",
+        target_id=str(record.id),
+        target_label=f"收入 {record.customer} {record.period} ¥{record.amount:g}",
+        summary=f"确认收入：{record.customer} {record.period} ¥{record.amount:g}",
+    )
     db.commit()
     db.refresh(record)
     return _to_out(record)
@@ -212,8 +220,23 @@ def update_revenue_record(
                 400, f"已收 {changes['received_amount']:.2f} 超过收入金额 {limit:.2f}"
             )
 
+    _labels = {
+        "amount": "收入金额", "invoiced": "是否开票",
+        "received_amount": "已收金额", "received_on": "收款日期", "remark": "备注",
+    }
+    before = {k: getattr(record, k, None) for k in changes}
     for field, value in changes.items():
         setattr(record, field, value)
+    diff = audit.changes_of(
+        before, {k: getattr(record, k, None) for k in changes}, _labels
+    )
+    if diff:
+        audit.record(
+            db, action="update", module="revenue",
+            target_id=str(record.id),
+            target_label=f"收入 {record.customer} {record.period}",
+            summary=audit.describe(diff), changes=diff,
+        )
     db.commit()
     db.refresh(record)
     return _to_out(record)
@@ -227,6 +250,12 @@ def withdraw_revenue(record: RevenueRecord, db: Session) -> int:
     要处处排除它们。
     """
     record_id = record.id
+    audit.record(
+        db, action="cancel", module="revenue",
+        target_id=str(record_id),
+        target_label=f"收入 {record.customer} {record.period} ¥{record.amount:g}",
+        summary=f"撤回已确认收入：{record.customer} {record.period} ¥{record.amount:g}",
+    )
     db.delete(record)
     db.commit()
     return record_id

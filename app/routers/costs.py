@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db, scoped
 from app.invoice_storage import (
     MAX_INVOICES_PER_COST,
@@ -187,11 +188,26 @@ def create_cost_record(req: CostRecordIn, db: Session) -> CostRecordOut:
     """
     record = CostRecord(**req.model_dump())
     db.add(record)
+    db.flush()
+    audit.record(
+        db, action="create", module="costs",
+        target_id=str(record.id),
+        target_label=f"成本 {record.category} ¥{(record.quantity or 0) * (record.unit_price or 0):g}",
+        summary=f"新增成本：{record.category} {record.quantity:g}×{record.unit_price:g}"
+                + (f"（{record.supplier}）" if record.supplier else ""),
+    )
     db.commit()
     db.refresh(record)
     # 走 record_out 而不是 _to_out：让出参与 web 端逐字段一致（含空的 invoices 列表），
     # 多一次查询换两个端不会在字段上分叉，值得。
     return record_out(db, record)
+
+
+_COST_LABELS = {
+    "category": "类别", "spec": "规格", "quantity": "数量", "unit_price": "单价",
+    "supplier": "供应商", "invoiced": "是否开票", "remark": "备注",
+    "purchase_date": "采购日期",
+}
 
 
 @router.post("", response_model=CostRecordOut)
@@ -250,8 +266,19 @@ def update_cost(record_id: int, req: CostRecordUpdate, db: Session = Depends(get
                 + "不能再改（会与仓库台账对不上），请先到物料管理撤销入库",
             )
 
+    before = {k: getattr(record, k, None) for k in changes}
     for field, value in changes.items():
         setattr(record, field, value)
+    diff = audit.changes_of(
+        before, {k: getattr(record, k, None) for k in changes}, _COST_LABELS
+    )
+    if diff:
+        audit.record(
+            db, action="update", module="costs",
+            target_id=str(record.id),
+            target_label=f"成本 {record.category} ¥{(record.quantity or 0) * (record.unit_price or 0):g}",
+            summary=audit.describe(diff), changes=diff,
+        )
     db.commit()
     db.refresh(record)
     return record_out(db, record)
@@ -264,6 +291,13 @@ def delete_cost(record_id: int, db: Session = Depends(get_db)):
         raise HTTPException(
             400, "这笔成本已纳入库存，不能删除；请先到物料管理撤销入库"
         )
+
+    audit.record(
+        db, action="delete", module="costs",
+        target_id=str(record.id),
+        target_label=f"成本 {record.category} ¥{(record.quantity or 0) * (record.unit_price or 0):g}",
+        summary=f"删除成本：{record.category} {record.quantity:g}×{record.unit_price:g}（{record.purchase_date}）",
+    )
 
     # 连图一起真删：软删留着文件的话，「删了又传」会不停堆孤儿文件，
     # 而且隐私上等于没删。先记路径，提交成功后再动磁盘。

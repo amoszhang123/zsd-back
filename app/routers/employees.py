@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import TenantScoped, get_db, scoped
 from app.models.inventory import IssueOrder, MaterialMovement, MaterialScrapOrder
 from app.models.production import (
@@ -149,6 +150,11 @@ def create_employee(data: EmployeeCreate, db: Session = Depends(get_db)):
 
     emp = Employee(**payload)
     db.add(emp)
+    audit.record(
+        db, action="create", module="employees",
+        target_id=emp.id, target_label=f"员工 {emp.name}（{emp.id}）",
+        summary=f"新增员工：{emp.name}（{emp.id}）" + (f" {emp.position}" if emp.position else ""),
+    )
     try:
         db.commit()
     except IntegrityError:
@@ -176,8 +182,22 @@ def update_employee(employee_id: str, data: EmployeeUpdate, db: Session = Depend
     # 改名/换号同样要查重，否则可以绕过新建时的唯一约束把两个员工改成同一个人
     _assert_unique(db, payload, exclude_id=employee_id)
 
+    _labels = {
+        "name": "姓名", "gender": "性别", "id_card": "身份证", "phone": "手机号",
+        "hire_date": "入职日期", "status": "在职状态", "position": "工种",
+        "employee_type": "用工性质", "work_start": "上班时间", "work_end": "下班时间",
+        "rest_minutes": "午休分钟",
+    }
+    before = {k: getattr(emp, k, None) for k in payload}
     for k, v in payload.items():
         setattr(emp, k, v)
+    diff = audit.changes_of(before, {k: getattr(emp, k, None) for k in payload}, _labels)
+    if diff:
+        audit.record(
+            db, action="update", module="employees",
+            target_id=emp.id, target_label=f"员工 {emp.name}（{emp.id}）",
+            summary=audit.describe(diff), changes=diff,
+        )
     try:
         db.commit()
     except IntegrityError:
@@ -202,6 +222,11 @@ def delete_employee(employee_id: str, db: Session = Depends(get_db)):
         )
 
     name = emp.name
+    audit.record(
+        db, action="delete", module="employees",
+        target_id=employee_id, target_label=f"员工 {name}（{employee_id}）",
+        summary=f"删除员工：{name}（{employee_id}）",
+    )
     db.delete(emp)
     db.commit()
     return {"deleted": employee_id, "name": name}

@@ -7,7 +7,10 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from sqlalchemy.orm import Session
+
 from app.config import settings
+from app.database import get_db
 from app.security import (
     is_hashed,
     login_throttle,
@@ -181,12 +184,34 @@ def get_me(authorization: str = Header("")):
     )
 
 
-def get_current_user(authorization: str = Header("")):
+def get_current_user(
+    request: Request,
+    authorization: str = Header(""),
+    db: Session = Depends(get_db),
+):
     token = authorization.replace("Bearer ", "")
     info = _get_token(token)
     if not info:
         raise HTTPException(401, "未登录或已过期")
+    # 把操作者挂在本次请求的 Session 上，业务代码写审计日志时不必再层层传 user
+    _remember_actor(db, info, request, kind="web")
     return info
+
+
+def _remember_actor(db, info: dict, request: Request | None, kind: str) -> None:
+    """记下当前请求的操作者，供 app/audit.py 取用。
+
+    web 会话用账号（admin），小程序会话用工号（999991）—— 同一个姓名在
+    后台和小程序里可能是两个人，user_kind 区分开才追得清。
+    """
+    from app import audit as audit_mod
+
+    audit_mod.set_actor(db, {
+        "user_id": info.get("employee_id") or info.get("username") or info.get("phone") or "",
+        "user_name": info.get("name") or "",
+        "user_kind": kind,
+        "ip": _client_ip(request) if request else "",
+    })
 
 
 def require_admin(user: dict = Depends(get_current_user)):

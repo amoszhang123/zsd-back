@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 
+from app import audit
 from app.database import get_db
 from app.models.contract import Contract, ContractItem, blocked_orders
 from app.models.order import (
@@ -250,6 +251,42 @@ def get_order(order_id: str, db: Session = Depends(get_db)):
     return _respond(db, order)
 
 
+# —— 审计 ——
+# 字段英文名 → 中文，日志是给人看的，别让人对着 due_date 猜
+_ORDER_LABELS = {
+    "order_no": "订单号",
+    "project_no": "项目号",
+    "material_no": "物料号",
+    "product": "产品",
+    "model": "型号",
+    "quantity": "数量",
+    "priority": "优先级",
+    "deadline": "交期",
+    "machining_minutes": "加工时长",
+    "estimated_hours": "预估工时",
+}
+
+
+def _step_label(idx) -> str:
+    """STEP_LABELS 是列表不是字典，越界或类型不对时退回数字。"""
+    try:
+        return STEP_LABELS[int(idx)]
+    except (IndexError, TypeError, ValueError):
+        return str(idx)
+
+
+def _audit_order(db, action: str, order, changes=None, summary: str = "") -> None:
+    audit.record(
+        db,
+        action=action,
+        module="orders",
+        target_id=order.id,
+        target_label=f"订单 {order.order_no or order.id}",
+        summary=summary or audit.describe(changes),
+        changes=changes,
+    )
+
+
 @router.post("", response_model=OrderResponse)
 def create_order(data: OrderCreate, db: Session = Depends(get_db)):
     ts = int(time.time() * 1000)
@@ -270,6 +307,7 @@ def create_order(data: OrderCreate, db: Session = Depends(get_db)):
     db.flush()
     for step in _build_steps(order_id):
         db.add(step)
+    _audit_order(db, "create", order, summary=f"新建订单（{data.quantity} 件）")
     db.commit()
     db.refresh(order)
     return _respond(db, order)
@@ -297,6 +335,13 @@ def import_orders(rows: list[OrderImportRow], db: Session = Depends(get_db)):
         for step in _build_steps(order_id):
             db.add(step)
         created.append(order)
+    if created:
+        audit.record(
+            db, action="import", module="orders",
+            target_id="",
+            target_label=f"{len(created)} 张订单",
+            summary=f"批量导入 {len(created)} 张订单",
+        )
     db.commit()
     for o in created:
         db.refresh(o)
@@ -380,8 +425,15 @@ def update_order(order_id: str, data: OrderUpdate, db: Session = Depends(get_db)
     if not order:
         raise HTTPException(404, "工单不存在")
     update_data = data.model_dump(exclude_unset=True)
+    # 先拍快照再改：审计要的是「改成了什么」，不是「现在是什么」
+    before = {k: getattr(order, k, None) for k in update_data}
     for k, v in update_data.items():
         setattr(order, k, v)
+    changes = audit.changes_of(
+        before, {k: getattr(order, k, None) for k in update_data}, _ORDER_LABELS
+    )
+    if changes:
+        _audit_order(db, "update", order, changes=changes)
     db.commit()
     db.refresh(order)
     return _respond(db, order)
@@ -408,8 +460,11 @@ def update_machining_minutes(
             f"{order_id} 当前为「{current}」",
         )
 
+    before = {"machining_minutes": order.machining_minutes, "estimated_hours": order.estimated_hours}
     order.machining_minutes = req.machining_minutes
     order.estimated_hours = hours_from_machining_minutes(req.machining_minutes)
+    after = {"machining_minutes": order.machining_minutes, "estimated_hours": order.estimated_hours}
+    _audit_order(db, "update", order, changes=audit.changes_of(before, after, _ORDER_LABELS))
     db.commit()
     db.refresh(order)
     return _respond(db, order)
@@ -428,10 +483,15 @@ def advance_step(order_id: str, db: Session = Depends(get_db)):
     if order.current_step >= 7:
         raise HTTPException(400, "工单已全部完成")
     steps = sorted(order.steps, key=lambda s: s.sort_order)
-    steps[order.current_step].status = "completed"
-    steps[order.current_step].time = date.today()
+    from_step = order.current_step
+    steps[from_step].status = "completed"
+    steps[from_step].time = date.today()
     order.current_step += 1
     steps[order.current_step].status = "processing"
+    _audit_order(
+        db, "update", order,
+        summary=f"推进工序：{_step_label(from_step)} → {_step_label(order.current_step)}",
+    )
     db.commit()
     db.refresh(order)
     return _respond(db, order)
@@ -472,6 +532,7 @@ def confirm_order(order_id: str, db: Session = Depends(get_db)):
         steps[idx].time = today
     order.current_step = target
     steps[target].status = "processing"
+    _audit_order(db, "approve", order, summary=f"接单，进入「{_step_label(target)}」")
     db.commit()
     db.refresh(order)
     return _respond(db, order)

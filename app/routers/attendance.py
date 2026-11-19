@@ -11,6 +11,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import attendance_calc as calc
+from app import audit
 from app.database import get_db, scoped
 from app.models.attendance import (
     LEAVE_APPROVED,
@@ -484,6 +485,15 @@ def approve_leave(
     row.status = LEAVE_APPROVED
     row.approver_id = approver
     row.approved_at = datetime.now()
+    emp = db.query(Employee).filter(Employee.id == row.employee_id).first()
+    audit.record(
+        db, action="approve", module="attendance",
+        target_id=str(row.id),
+        target_label=f"请假 {emp.name if emp else row.employee_id} {row.start_date}",
+        summary=f"批准请假：{emp.name if emp else row.employee_id} "
+                f"{row.start_date}{'~' + str(row.end_date) if row.end_date != row.start_date else ''} "
+                f"{row.days:g} 天（{ltype.name if ltype else ''}）",
+    )
     db.commit()
     db.refresh(row)
     types, emps = _leave_type_map(db), _employee_map(db)
@@ -504,6 +514,13 @@ def reject_leave(
     row.reject_reason = req.reason
     row.approver_id = approver
     row.approved_at = datetime.now()
+    emp = db.query(Employee).filter(Employee.id == row.employee_id).first()
+    audit.record(
+        db, action="reject", module="attendance",
+        target_id=str(row.id),
+        target_label=f"请假 {emp.name if emp else row.employee_id} {row.start_date}",
+        summary=f"驳回请假：{emp.name if emp else row.employee_id} {row.start_date}，理由：{req.reason}",
+    )
     db.commit()
     db.refresh(row)
     types, emps = _leave_type_map(db), _employee_map(db)
@@ -534,6 +551,13 @@ def cancel_leave(
     row.status = LEAVE_CANCELLED
     row.approver_id = operator
     row.approved_at = datetime.now()
+    emp = db.query(Employee).filter(Employee.id == row.employee_id).first()
+    audit.record(
+        db, action="cancel", module="attendance",
+        target_id=str(row.id),
+        target_label=f"请假 {emp.name if emp else row.employee_id} {row.start_date}",
+        summary=f"撤销请假：{emp.name if emp else row.employee_id} {row.start_date} {row.days:g} 天",
+    )
     db.commit()
     db.refresh(row)
     types, emps = _leave_type_map(db), _employee_map(db)
@@ -584,6 +608,15 @@ def upsert_record(req: AttendanceRecordIn, db: Session = Depends(get_db)):
     row.clock_out = _parse_day_time(req.work_date, req.clock_out) if req.clock_out else None
     row.source = SOURCE_MANUAL
     row.remark = req.remark
+    # 补录会直接改考勤结论（迟到变正常、缺勤变出勤），必须留痕
+    audit.record(
+        db, action="update", module="attendance",
+        target_id=str(row.id),
+        target_label=f"考勤 {emp.name} {req.work_date}",
+        summary=f"补录打卡：{emp.name} {req.work_date} "
+                f"{req.clock_in or '—'} ~ {req.clock_out or '—'}"
+                + (f"（{req.remark}）" if req.remark else ""),
+    )
     db.commit()
 
     # 返回这个人这个月的日历，前端直接替换掉该行，不用整页刷新

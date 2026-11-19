@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.database import get_db
 from app.models.permission import PositionModulePermission
 from app.models.production import POSITION_ADMIN, Employee
@@ -114,11 +115,33 @@ def update_position_modules(
     visible = {m.key: m.visible for m in data.modules}
     visible.pop(SELF_MODULE_KEY, None)
 
+    # 改权限是高危操作：谁能看到哪些模块直接决定哪些数据被谁看见，
+    # 记下改前后的可见清单，出问题能对上时间点。
+    old_visible = sorted(
+        r.module_key
+        for r in db.query(PositionModulePermission)
+        .filter(PositionModulePermission.position == position)
+        .all()
+        if r.visible
+    )
+    new_visible = sorted(k for k, v in visible.items() if v)
+
     db.query(PositionModulePermission).filter(
         PositionModulePermission.position == position
     ).delete()
     for key, is_visible in visible.items():
         db.add(PositionModulePermission(position=position, module_key=key, visible=is_visible))
+
+    audit.record(
+        db, action="update", module="permissions",
+        target_id=position, target_label=f"工种权限 {position}",
+        summary=f"修改「{position}」可见模块：{len(old_visible)} 个 → {len(new_visible)} 个",
+        changes=[{
+            "field": "visible_modules", "label": "可见模块",
+            "before": "、".join(old_visible) or "（无）",
+            "after": "、".join(new_visible) or "（无）",
+        }],
+    )
     db.commit()
 
     return PositionPermissions(

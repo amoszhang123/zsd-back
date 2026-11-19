@@ -12,7 +12,7 @@ from app.invoice_storage import ensure_root
 from app.routers import (
     health, dashboard, orders, contracts, quotes, shipments, production,
     employees, auth, mp, quality, costs, materials, machines, bank, permissions,
-    mp_materials, cash, revenue, overview, attendance,
+    mp_materials, cash, revenue, overview, attendance, audit,
 )
 from app.routers.auth import get_current_user, PLAINTEXT_USERS, USING_DEFAULT_USERS
 
@@ -149,6 +149,8 @@ app.include_router(bank.router, dependencies=AUTH)
 app.include_router(permissions.router, dependencies=AUTH)
 # 考勤（一期：打卡/请假/日历，不含工资）
 app.include_router(attendance.router, dependencies=AUTH)
+# 审计日志查询（只读）
+app.include_router(audit.router, dependencies=AUTH)
 
 # 发票图片：直接按 /api/uploads/invoices/2026/11/<uuid>.jpg 直出。
 # 挂在 /api 前缀下是为了复用现有反代（线上 /api 已经指向本服务），

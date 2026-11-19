@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 
+from app import audit
 from app.database import get_db
 from app.models.contract import (
     ALLOWED_STATUS_TRANSITIONS,
@@ -294,6 +295,7 @@ def update_contract_item_quantity(
     ):
         raise HTTPException(409, f"工单 {item.order_id} 已进入开工单，数量不可修改")
 
+    old_qty = item.quantity
     item.quantity = req.quantity
     item.amount = round(req.quantity * item.unit_price, 2)
     item.updated_at = datetime.now()
@@ -307,6 +309,15 @@ def update_contract_item_quantity(
     if not contract.amount_manual:
         contract.total_amount = round(sum(i.amount for i in contract.items), 2)
 
+    audit.record(
+        db, action="update", module="contracts",
+        target_id=f"{contract_id}#{item_id}",
+        target_label=f"合同 {contract.contract_no or contract_id} 明细 #{item_id}",
+        summary="修改合同明细数量",
+        changes=audit.changes_of(
+            {"quantity": old_qty}, {"quantity": item.quantity}, {"quantity": "数量"}
+        ),
+    )
     db.commit()
     db.refresh(contract)
     return _to_detail(db, contract, _locked_item_ids(db, contract))
