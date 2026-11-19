@@ -36,6 +36,23 @@ def _log_login_switches() -> None:
     就能确认到底是没开开关、还是代码没上线。
     """
     log = logging.getLogger("uvicorn.error")
+
+    # 密码配置的自检。这两条都属于「配错了也能启动，但登录一定失败」的情况，
+    # 而症状（登不进去）跟「密码记错」长得一样，很容易白白排查半天。
+    if USING_DEFAULT_USERS:
+        log.warning(
+            "web 登录仍在用内置默认账号（admin/admin123）—— 生产必须在 .env 配置 WEB_USERS"
+        )
+    elif PLAINTEXT_USERS:
+        # 最常见的原因：.env 里 scrypt$salt$hash 没有把 $ 写成 $$，
+        # docker compose 把 $... 当变量替换成空串，哈希退化成一个 "scrypt"。
+        log.error(
+            "WEB_USERS 里这些账号的密码不是有效的 scrypt 哈希：%s —— "
+            "如果 .env 里写的是 scrypt$...，请把每个 $ 改成 $$（compose 会还原），"
+            "改完 docker compose up -d 重建容器",
+            ", ".join(PLAINTEXT_USERS),
+        )
+
     if settings.mp_sms_test_enabled:
         log.warning(
             "短信登录已开启：仅 %s 可用固定验证码登录（提审期间用，审核结束请关闭）",
